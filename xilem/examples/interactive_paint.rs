@@ -11,7 +11,7 @@ use masonry_winit::app::{EventLoop, EventLoopBuilder};
 use vello::{kurbo::{BezPath, Line}, Scene};
 use winit::error::EventLoopError;
 use xilem::core::{Arg, MessageContext, Mut, View, ViewArgument, ViewMarker};
-use xilem::view::{button, flex_col, label, sized_box};
+use xilem::view::{flex_col, label, sized_box};
 use xilem::{Color, Pod, ViewCtx, WidgetView, WindowOptions, Xilem};
 use xilem_core::{Edit, MessageResult};
 
@@ -64,8 +64,15 @@ impl Widget for CircleWidget {
         let size = self.radius * 2.0 + 10.0;
         bc.constrain((size, size))
     }
+    
+    fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _: &mut PropertiesMut<'_>, event: &PointerEvent) {
+        if matches!(event, PointerEvent::Down { .. }) {
+            ctx.submit_action::<()>(());
+        }
+    }
 }
 
+#[derive(Debug)]
 struct Circle {
     color: Color,
     radius: f64,
@@ -108,6 +115,78 @@ impl<State: ViewArgument, Action> View<State, Action, ViewCtx> for Circle {
 impl PartialEq for Circle {
     fn eq(&self, other: &Self) -> bool {
         self.color == other.color && self.radius == other.radius
+    }
+}
+
+#[derive(Debug)]
+struct ClickableCircle<State, Action, F> {
+    circle: Circle,
+    on_click: F,
+    phantom: std::marker::PhantomData<fn(State) -> Action>,
+}
+
+fn clickable_circle<F>(
+    color: Color,
+    radius: f64,
+    on_click: F,
+) -> ClickableCircle<Edit<InteractivePaintApp>, (), F>
+where
+    F: Fn(&mut InteractivePaintApp) -> () + Send + Sync + 'static,
+{
+    ClickableCircle {
+        circle: Circle::new(color, radius),
+        on_click,
+        phantom: std::marker::PhantomData,
+    }
+}
+
+impl<State, Action, F> ViewMarker for ClickableCircle<State, Action, F> {}
+
+impl<F> View<Edit<InteractivePaintApp>, (), ViewCtx> for ClickableCircle<Edit<InteractivePaintApp>, (), F>
+where
+    F: Fn(&mut InteractivePaintApp) -> () + Send + Sync + 'static,
+{
+    type Element = Pod<CircleWidget>;
+    type ViewState = ();
+
+    fn build(&self, ctx: &mut ViewCtx, _: Arg<'_, Edit<InteractivePaintApp>>) -> (Self::Element, Self::ViewState) {
+        let widget = CircleWidget {
+            color: self.circle.color,
+            radius: self.circle.radius,
+        };
+        (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
+    }
+
+    fn rebuild(&self, prev: &Self, _: &mut Self::ViewState, _: &mut ViewCtx, mut element: Mut<'_, Self::Element>, _: Arg<'_, Edit<InteractivePaintApp>>) {
+        if prev.circle.color != self.circle.color {
+            element.widget.color = self.circle.color;
+            element.ctx.request_paint_only();
+        }
+        if prev.circle.radius != self.circle.radius {
+            element.widget.radius = self.circle.radius;
+            element.ctx.request_layout();
+        }
+    }
+    
+    fn teardown(&self, _: &mut Self::ViewState, ctx: &mut ViewCtx, element: Mut<'_, Self::Element>) {
+        ctx.teardown_leaf(element);
+    }
+    
+    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, _: Mut<'_, Self::Element>, app_state: Arg<'_, Edit<InteractivePaintApp>>) -> MessageResult<()> {
+        if message.take_first().is_some() {
+            tracing::warn!("Got unexpected id path in ClickableCircle::message");
+            return MessageResult::Stale;
+        }
+        match message.take_message::<()>() {
+            Some(_) => {
+                (self.on_click)(app_state);
+                MessageResult::Action(())
+            },
+            None => {
+                tracing::error!("Wrong message type in ClickableCircle::message: {message:?}, expected ()");
+                MessageResult::Stale
+            }
+        }
     }
 }
 
@@ -219,28 +298,24 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
         label(format!("Interactive Paint - Clicks: {}", data.click_count)),
         
         // Clickable red circle
-        button(
-            Circle::new(
-                if data.circle1_clicked { Color::from_rgb8(255, 100, 100) } else { Color::from_rgb8(200, 0, 0) },
-                30.0
-            ),
-            |data: &mut InteractivePaintApp| {
+        sized_box(clickable_circle(
+            if data.circle1_clicked { Color::from_rgb8(255, 100, 100) } else { Color::from_rgb8(255, 0, 0) },
+            50.0,
+|data: &mut InteractivePaintApp| {
                 data.click_count += 1;
                 data.circle1_clicked = !data.circle1_clicked;
             },
-        ),
+        )).width(110.px()).height(110.px()),
         
         // Clickable blue circle
-        button(
-            Circle::new(
-                if data.circle2_clicked { Color::from_rgb8(100, 100, 255) } else { Color::from_rgb8(0, 0, 200) },
-                30.0
-            ),
-            |data: &mut InteractivePaintApp| {
+        sized_box(clickable_circle(
+            if data.circle2_clicked { Color::from_rgb8(100, 100, 255) } else { Color::from_rgb8(0, 0, 255) },
+            60.0,
+|data: &mut InteractivePaintApp| {
                 data.click_count += 1;
                 data.circle2_clicked = !data.circle2_clicked;
             },
-        ),
+        )).width(130.px()).height(130.px()),
         
         // Custom painted line
         sized_box(LineView)
