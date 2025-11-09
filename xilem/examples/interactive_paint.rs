@@ -19,6 +19,8 @@ struct InteractivePaintApp {
     circle1_clicked: bool,
     circle2_clicked: bool,
     click_count: i32,
+    circle1_pos: (f64, f64),
+    circle2_pos: (f64, f64),
 }
 
 impl Default for InteractivePaintApp {
@@ -27,6 +29,8 @@ impl Default for InteractivePaintApp {
             circle1_clicked: false,
             circle2_clicked: false,
             click_count: 0,
+            circle1_pos: (55.0, 55.0),
+            circle2_pos: (65.0, 65.0),
         }
     }
 }
@@ -36,6 +40,7 @@ impl Default for InteractivePaintApp {
 struct CircleWidget {
     color: Color,
     radius: f64,
+    pos: (f64, f64),
 }
 
 impl Widget for CircleWidget {
@@ -53,10 +58,8 @@ impl Widget for CircleWidget {
         ChildrenIds::from_slice(&[])
     }
     
-    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, scene: &mut Scene) {
-        let size = ctx.size();
-        let center = (size.width / 2.0, size.height / 2.0);
-        let circle = vello::kurbo::Circle::new(center, self.radius);
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, scene: &mut Scene) {
+        let circle = vello::kurbo::Circle::new(self.pos, self.radius);
         fill(scene, &circle, self.color);
     }
     
@@ -66,8 +69,24 @@ impl Widget for CircleWidget {
     }
     
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _: &mut PropertiesMut<'_>, event: &PointerEvent) {
-        if matches!(event, PointerEvent::Down { .. }) {
-            ctx.submit_action::<()>(());
+        match event {
+            PointerEvent::Down(_) => {
+                ctx.capture_pointer();
+                ctx.submit_action::<()>(());
+            }
+            PointerEvent::Move(e) => {
+                if ctx.is_active() {
+                    let local_pos = ctx.local_position(e.current.position);
+                    self.pos = (local_pos.x, local_pos.y);
+                    ctx.request_paint_only();
+                }
+            }
+            PointerEvent::Up(_) => {
+                if ctx.is_active() {
+                    ctx.release_pointer();
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -91,7 +110,7 @@ impl<State: ViewArgument, Action> View<State, Action, ViewCtx> for Circle {
     type ViewState = ();
 
     fn build(&self, ctx: &mut ViewCtx, _: Arg<'_, State>) -> (Self::Element, Self::ViewState) {
-        (ctx.create_pod(CircleWidget { color: self.color, radius: self.radius }), ())
+        (ctx.create_pod(CircleWidget { color: self.color, radius: self.radius, pos: (50.0, 50.0) }), ())
     }
 
     fn rebuild(&self, prev: &Self, _: &mut Self::ViewState, _: &mut ViewCtx, mut element: Mut<'_, Self::Element>, _: Arg<'_, State>) {
@@ -119,32 +138,35 @@ impl PartialEq for Circle {
 }
 
 #[derive(Debug)]
-struct ClickableCircle<State, Action, F> {
+struct DraggableCircle<State, Action, F> {
     circle: Circle,
+    pos: (f64, f64),
     on_click: F,
     phantom: std::marker::PhantomData<fn(State) -> Action>,
 }
 
-fn clickable_circle<F>(
+fn draggable_circle<F>(
     color: Color,
     radius: f64,
+    pos: (f64, f64),
     on_click: F,
-) -> ClickableCircle<Edit<InteractivePaintApp>, (), F>
+) -> DraggableCircle<Edit<InteractivePaintApp>, (), F>
 where
-    F: Fn(&mut InteractivePaintApp) -> () + Send + Sync + 'static,
+    F: Fn(&mut InteractivePaintApp, (f64, f64)) -> () + Send + Sync + 'static,
 {
-    ClickableCircle {
+    DraggableCircle {
         circle: Circle::new(color, radius),
+        pos,
         on_click,
         phantom: std::marker::PhantomData,
     }
 }
 
-impl<State, Action, F> ViewMarker for ClickableCircle<State, Action, F> {}
+impl<State, Action, F> ViewMarker for DraggableCircle<State, Action, F> {}
 
-impl<F> View<Edit<InteractivePaintApp>, (), ViewCtx> for ClickableCircle<Edit<InteractivePaintApp>, (), F>
+impl<F> View<Edit<InteractivePaintApp>, (), ViewCtx> for DraggableCircle<Edit<InteractivePaintApp>, (), F>
 where
-    F: Fn(&mut InteractivePaintApp) -> () + Send + Sync + 'static,
+    F: Fn(&mut InteractivePaintApp, (f64, f64)) -> () + Send + Sync + 'static,
 {
     type Element = Pod<CircleWidget>;
     type ViewState = ();
@@ -153,6 +175,7 @@ where
         let widget = CircleWidget {
             color: self.circle.color,
             radius: self.circle.radius,
+            pos: self.pos,
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
@@ -166,24 +189,29 @@ where
             element.widget.radius = self.circle.radius;
             element.ctx.request_layout();
         }
+        if prev.pos != self.pos {
+            element.widget.pos = self.pos;
+            element.ctx.request_paint_only();
+        }
     }
     
     fn teardown(&self, _: &mut Self::ViewState, ctx: &mut ViewCtx, element: Mut<'_, Self::Element>) {
         ctx.teardown_leaf(element);
     }
     
-    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, _: Mut<'_, Self::Element>, app_state: Arg<'_, Edit<InteractivePaintApp>>) -> MessageResult<()> {
+    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, element: Mut<'_, Self::Element>, app_state: Arg<'_, Edit<InteractivePaintApp>>) -> MessageResult<()> {
         if message.take_first().is_some() {
-            tracing::warn!("Got unexpected id path in ClickableCircle::message");
+            tracing::warn!("Got unexpected id path in DraggableCircle::message");
             return MessageResult::Stale;
         }
         match message.take_message::<()>() {
             Some(_) => {
-                (self.on_click)(app_state);
+                let new_pos = element.widget.pos;
+                (self.on_click)(app_state, new_pos);
                 MessageResult::Action(())
             },
             None => {
-                tracing::error!("Wrong message type in ClickableCircle::message: {message:?}, expected ()");
+                tracing::error!("Wrong message type in DraggableCircle::message: {message:?}, expected ()");
                 MessageResult::Stale
             }
         }
@@ -297,25 +325,29 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
     flex_col((
         label(format!("Interactive Paint - Clicks: {}", data.click_count)),
         
-        // Clickable red circle
-        sized_box(clickable_circle(
+        // Draggable red circle
+        sized_box(draggable_circle(
             if data.circle1_clicked { Color::from_rgb8(255, 100, 100) } else { Color::from_rgb8(255, 0, 0) },
             50.0,
-|data: &mut InteractivePaintApp| {
+            data.circle1_pos,
+            |data: &mut InteractivePaintApp, pos: (f64, f64)| {
                 data.click_count += 1;
                 data.circle1_clicked = !data.circle1_clicked;
+                data.circle1_pos = pos;
             },
-        )).width(110.px()).height(110.px()),
+        )).width(400.px()).height(300.px()),
         
-        // Clickable blue circle
-        sized_box(clickable_circle(
+        // Draggable blue circle
+        sized_box(draggable_circle(
             if data.circle2_clicked { Color::from_rgb8(100, 100, 255) } else { Color::from_rgb8(0, 0, 255) },
             60.0,
-|data: &mut InteractivePaintApp| {
+            data.circle2_pos,
+            |data: &mut InteractivePaintApp, pos: (f64, f64)| {
                 data.click_count += 1;
                 data.circle2_clicked = !data.circle2_clicked;
+                data.circle2_pos = pos;
             },
-        )).width(130.px()).height(130.px()),
+        )).width(400.px()).height(300.px()),
         
         // Custom painted line
         sized_box(LineView)
