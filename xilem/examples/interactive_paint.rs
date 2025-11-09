@@ -1,20 +1,145 @@
 // Copyright 2024 the Xilem Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Custom paint example
+//! Interactive custom paint example with clickable circles
 
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
-use masonry::properties::{types::AsUnit, Background};
+use masonry::properties::types::AsUnit;
 use masonry::util::{fill, stroke};
 use masonry_winit::app::{EventLoop, EventLoopBuilder};
 use vello::{kurbo::{BezPath, Line}, Scene};
 use winit::error::EventLoopError;
 use xilem::core::{Arg, MessageContext, Mut, View, ViewArgument, ViewMarker};
-use xilem::style::Style as _;
 use xilem::view::{flex_col, label, sized_box};
 use xilem::{Color, Pod, ViewCtx, WidgetView, WindowOptions, Xilem};
 use xilem_core::{Edit, MessageResult};
+
+struct InteractivePaintApp {
+    circle1_clicked: bool,
+    circle2_clicked: bool,
+    click_count: i32,
+}
+
+impl Default for InteractivePaintApp {
+    fn default() -> Self {
+        Self {
+            circle1_clicked: false,
+            circle2_clicked: false,
+            click_count: 0,
+        }
+    }
+}
+
+pub struct CircleWidget {
+    color: Color,
+    radius: f64,
+}
+
+impl Widget for CircleWidget {
+    type Action = ();
+
+    fn register_children(&mut self, _: &mut RegisterCtx<'_>) {}
+    
+    fn accessibility_role(&self) -> masonry::accesskit::Role {
+        masonry::accesskit::Role::Button
+    }
+    
+    fn accessibility(&mut self, _: &mut AccessCtx<'_>, _: &PropertiesRef<'_>, _: &mut masonry::accesskit::Node) {}
+    
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::from_slice(&[])
+    }
+    
+    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, scene: &mut Scene) {
+        let size = ctx.size();
+        let center_x = size.width / 2.0;
+        let center_y = size.height / 2.0;
+        let circle = vello::kurbo::Circle::new((center_x, center_y), self.radius);
+        fill(scene, &circle, self.color);
+    }
+    
+    fn layout(&mut self, _: &mut LayoutCtx<'_>, _: &mut PropertiesMut<'_>, bc: &BoxConstraints) -> vello::kurbo::Size {
+        let size = self.radius * 2.0 + 10.0;
+        bc.constrain((size, size))
+    }
+    
+    fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _: &mut PropertiesMut<'_>, event: &PointerEvent) {
+        if matches!(event, PointerEvent::Down { .. }) {
+            ctx.submit_action::<()>(());
+        }
+    }
+}
+
+
+
+#[derive(Debug)]
+pub struct ClickableCircle<State, Action, F> {
+    color: Color,
+    radius: f64,
+    on_click: F,
+    phantom: std::marker::PhantomData<fn(State) -> Action>,
+}
+
+/// Creates a clickable circle widget
+pub fn clickable_circle<
+    State: ViewArgument,
+    Action,
+    F: Fn(Arg<'_, State>) -> Action + Send + Sync + 'static,
+>(
+    color: Color,
+    radius: f64,
+    on_click: F,
+) -> ClickableCircle<State, Action, F> {
+    ClickableCircle {
+        color,
+        radius,
+        on_click,
+        phantom: std::marker::PhantomData,
+    }
+}
+
+impl<State, Action, F> ViewMarker for ClickableCircle<State, Action, F> {}
+
+impl<State, Action, F> View<State, Action, ViewCtx> for ClickableCircle<State, Action, F>
+where
+    State: ViewArgument,
+    Action: 'static,
+    F: Fn(Arg<'_, State>) -> Action + Send + Sync + 'static,
+{
+    type Element = Pod<CircleWidget>;
+    type ViewState = ();
+
+    fn build(&self, ctx: &mut ViewCtx, _: Arg<'_, State>) -> (Self::Element, Self::ViewState) {
+        let widget = CircleWidget {
+            color: self.color,
+            radius: self.radius,
+        };
+        (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
+    }
+
+    fn rebuild(&self, _: &Self, _: &mut Self::ViewState, _: &mut ViewCtx, _: Mut<'_, Self::Element>, _: Arg<'_, State>) {}
+    
+    fn teardown(&self, _: &mut Self::ViewState, ctx: &mut ViewCtx, element: Mut<'_, Self::Element>) {
+        ctx.teardown_leaf(element);
+    }
+    
+    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, _: Mut<'_, Self::Element>, app_state: Arg<'_, State>) -> MessageResult<Action> {
+        if message.take_first().is_some() {
+            tracing::warn!("Got unexpected id path in ClickableCircle::message");
+            return MessageResult::Stale;
+        }
+        match message.take_message::<()>() {
+            Some(_) => MessageResult::Action((self.on_click)(app_state)),
+            None => {
+                tracing::error!("Wrong message type in ClickableCircle::message: {message:?}, expected ()");
+                MessageResult::Stale
+            }
+        }
+    }
+}
+
+
 
 struct LineWidget;
 
@@ -119,23 +244,29 @@ impl<State: ViewArgument, Action> View<State, Action, ViewCtx> for LineView {
     }
 }
 
-struct CustomPaintApp;
-
-fn app_logic(_data: &mut CustomPaintApp) -> impl WidgetView<Edit<CustomPaintApp>> + use<> {
+fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<InteractivePaintApp>> + use<> {
     flex_col((
-        // Red circle
-        sized_box(label("Circle 1"))
-            .width(100.px())
-            .height(100.px())
-            .background(Background::Color(Color::from_rgb8(255, 0, 0)))
-            .corner_radius(50.0),
+        label(format!("Interactive Paint - Clicks: {}", data.click_count)),
         
-        // Blue circle
-        sized_box(label("Circle 2"))
-            .width(120.px())
-            .height(120.px())
-            .background(Background::Color(Color::from_rgb8(0, 0, 255)))
-            .corner_radius(60.0),
+        // Clickable red circle
+        sized_box(clickable_circle(
+            if data.circle1_clicked { Color::from_rgb8(255, 100, 100) } else { Color::from_rgb8(255, 0, 0) },
+            50.0,
+            |data: &mut InteractivePaintApp| {
+                data.click_count += 1;
+                data.circle1_clicked = !data.circle1_clicked;
+            },
+        )).width(110.px()).height(110.px()),
+        
+        // Clickable blue circle
+        sized_box(clickable_circle(
+            if data.circle2_clicked { Color::from_rgb8(100, 100, 255) } else { Color::from_rgb8(0, 0, 255) },
+            60.0,
+            |data: &mut InteractivePaintApp| {
+                data.click_count += 1;
+                data.circle2_clicked = !data.circle2_clicked;
+            },
+        )).width(130.px()).height(130.px()),
         
         // Custom painted line
         sized_box(LineView)
@@ -150,11 +281,11 @@ fn app_logic(_data: &mut CustomPaintApp) -> impl WidgetView<Edit<CustomPaintApp>
 }
 
 fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
-    let data = CustomPaintApp;
+    let data = InteractivePaintApp::default();
     let app = Xilem::new_simple(
         data,
         app_logic,
-        WindowOptions::new("Custom Paint").with_initial_inner_size(LogicalSize::new(400.0, 600.0)),
+        WindowOptions::new("Interactive Paint").with_initial_inner_size(LogicalSize::new(400.0, 700.0)),
     );
     app.run_in(event_loop)
 }
