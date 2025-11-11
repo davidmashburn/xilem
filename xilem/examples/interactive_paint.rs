@@ -41,6 +41,9 @@ struct CircleWidget {
     color: Color,
     radius: f64,
     pos: (f64, f64),
+    has_dragged: bool,
+    initial_click_pos: Option<vello::kurbo::Point>,
+    initial_circle_pos: (f64, f64),
 }
 
 impl Widget for CircleWidget {
@@ -70,20 +73,32 @@ impl Widget for CircleWidget {
     
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _: &mut PropertiesMut<'_>, event: &PointerEvent) {
         match event {
-            PointerEvent::Down(_) => {
+            PointerEvent::Down(e) => {
                 ctx.capture_pointer();
-                ctx.submit_action::<()>(());
+                self.has_dragged = false;
+                let local_pos = ctx.local_position(e.state.position);
+                self.initial_click_pos = Some(local_pos);
+                self.initial_circle_pos = self.pos;
             }
             PointerEvent::Move(e) => {
                 if ctx.is_active() {
-                    let local_pos = ctx.local_position(e.current.position);
-                    self.pos = (local_pos.x, local_pos.y);
-                    ctx.request_paint_only();
+                    if let Some(initial_click) = self.initial_click_pos {
+                        let current_pos = ctx.local_position(e.current.position);
+                        let delta_x = current_pos.x - initial_click.x;
+                        let delta_y = current_pos.y - initial_click.y;
+                        self.pos = (self.initial_circle_pos.0 + delta_x, self.initial_circle_pos.1 + delta_y);
+                        self.has_dragged = true;
+                        ctx.request_paint_only();
+                    }
                 }
             }
             PointerEvent::Up(_) => {
                 if ctx.is_active() {
                     ctx.release_pointer();
+                    if self.has_dragged {
+                        ctx.submit_action::<()>(());
+                    }
+                    self.initial_click_pos = None;
                 }
             }
             _ => {}
@@ -110,7 +125,7 @@ impl<State: ViewArgument, Action> View<State, Action, ViewCtx> for Circle {
     type ViewState = ();
 
     fn build(&self, ctx: &mut ViewCtx, _: Arg<'_, State>) -> (Self::Element, Self::ViewState) {
-        (ctx.create_pod(CircleWidget { color: self.color, radius: self.radius, pos: (50.0, 50.0) }), ())
+        (ctx.create_pod(CircleWidget { color: self.color, radius: self.radius, pos: (50.0, 50.0), has_dragged: false, initial_click_pos: None, initial_circle_pos: (50.0, 50.0) }), ())
     }
 
     fn rebuild(&self, prev: &Self, _: &mut Self::ViewState, _: &mut ViewCtx, mut element: Mut<'_, Self::Element>, _: Arg<'_, State>) {
@@ -176,6 +191,9 @@ where
             color: self.circle.color,
             radius: self.circle.radius,
             pos: self.pos,
+            has_dragged: false,
+            initial_click_pos: None,
+            initial_circle_pos: self.pos,
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
