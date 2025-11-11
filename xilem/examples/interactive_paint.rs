@@ -184,7 +184,7 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         ctx.teardown_leaf(element);
     }
     
-    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, _element: Mut<'_, Self::Element>, mut app_state: Arg<'_, Edit<InteractivePaintApp>>) -> MessageResult<()> {
+    fn message(&self, _: &mut Self::ViewState, message: &mut MessageContext, _element: Mut<'_, Self::Element>, app_state: Arg<'_, Edit<InteractivePaintApp>>) -> MessageResult<()> {
         if message.take_first().is_some() {
             return MessageResult::Stale;
         }
