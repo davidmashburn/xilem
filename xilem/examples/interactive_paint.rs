@@ -261,13 +261,28 @@ impl Widget for CanvasWidget {
                     let current = ctx.local_position(e.current.position);
                     let delta = current - anchor;
                     self.geometry = apply_drag(start_geometry, target, delta);
-                    ctx.submit_action::<CanvasAction>(CanvasAction::Geometry(
-                        self.geometry.clone(),
-                    ));
+                    self.reset_render_progress();
+                    ctx.request_anim_frame();
                     ctx.request_paint_only();
                 }
             }
-            PointerEvent::Up(_) | PointerEvent::Cancel(_) => {
+            PointerEvent::Up(_) => {
+                if ctx.is_active() {
+                    ctx.release_pointer();
+                }
+                if let Some(start_geometry) = self.drag_start_geometry.as_ref() {
+                    if self.geometry.generator_points != start_geometry.generator_points {
+                        ctx.submit_action::<CanvasAction>(CanvasAction::Geometry(
+                            self.geometry.clone(),
+                        ));
+                    }
+                }
+                self.drag_target = None;
+                self.drag_anchor = None;
+                self.drag_start_geometry = None;
+                ctx.request_paint_only();
+            }
+            PointerEvent::Cancel(_) => {
                 if ctx.is_active() {
                     ctx.release_pointer();
                 }
