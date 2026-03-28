@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
-use masonry::peniko::Fill;
+use masonry::peniko::{Fill, ImageBrush, ImageFormat};
 use masonry::properties::types::{AsUnit, CrossAxisAlignment};
 use masonry::util::fill;
 use masonry::vello::kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Size, Stroke, Vec2};
 use masonry::vello::Scene;
 use masonry_winit::app::{EventLoop, EventLoopBuilder};
+use vello::peniko::{ImageAlphaType, ImageData};
 use winit::error::EventLoopError;
 use xilem::core::{Arg, MessageContext, Mut, View, ViewMarker};
 use xilem::style::Style;
@@ -159,7 +160,7 @@ struct CanvasWidget {
     drag_anchor: Option<Point>,
     drag_start_geometry: Option<FractalGeometry>,
     pending_segments: VecDeque<SegmentJob>,
-    rendered_segments: Vec<(Point, Point)>,
+    raster_buffer: Vec<u8>,
 }
 
 impl Widget for CanvasWidget {
@@ -185,7 +186,14 @@ impl Widget for CanvasWidget {
                 || distance(job.start, job.end) <= MIN_SEGMENT_LENGTH
                 || local_points.len() < 2
             {
-                self.rendered_segments.push((job.start, job.end));
+                rasterize_line(
+                    &mut self.raster_buffer,
+                    CANVAS_WIDTH as usize,
+                    CANVAS_HEIGHT as usize,
+                    job.start,
+                    job.end,
+                    [28, 96, 99, 255],
+                );
                 continue;
             }
             for pair in local_points.windows(2).rev() {
@@ -323,15 +331,14 @@ impl Widget for CanvasWidget {
             &preview_rect,
         );
 
-        for &(start, end) in &self.rendered_segments {
-            scene.stroke(
-                &Stroke::new(1.15),
-                Affine::IDENTITY,
-                Color::from_rgb8(28, 96, 99),
-                None,
-                &Line::new(start, end),
-            );
-        }
+        let image = ImageBrush::new(ImageData {
+            data: self.raster_buffer.clone().into(),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: CANVAS_WIDTH as u32,
+            height: CANVAS_HEIGHT as u32,
+        });
+        scene.draw_image(&image, Affine::IDENTITY);
 
         if self.show_guides {
             paint_generator_guides(scene, &self.geometry.generator_points);
@@ -344,7 +351,7 @@ impl Widget for CanvasWidget {
 
 impl CanvasWidget {
     fn reset_render_progress(&mut self) {
-        self.rendered_segments.clear();
+        self.raster_buffer.fill(0);
         self.pending_segments.clear();
         if self.geometry.generator_points.len() >= 2 {
             let baseline = self.geometry.baseline();
@@ -399,7 +406,7 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             drag_anchor: None,
             drag_start_geometry: None,
             pending_segments: VecDeque::new(),
-            rendered_segments: Vec::new(),
+            raster_buffer: vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
@@ -700,6 +707,58 @@ fn distance(a: Point, b: Point) -> f64 {
 
 fn cross(a: Vec2, b: Vec2) -> f64 {
     a.x * b.y - a.y * b.x
+}
+
+fn rasterize_line(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    start: Point,
+    end: Point,
+    color: [u8; 4],
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let steps = dx.abs().max(dy.abs()).ceil() as usize;
+    if steps == 0 {
+        blend_pixel(
+            buffer,
+            width,
+            height,
+            start.x.round() as isize,
+            start.y.round() as isize,
+            color,
+        );
+        return;
+    }
+
+    for step in 0..=steps {
+        let t = step as f64 / steps as f64;
+        let x = start.x + dx * t;
+        let y = start.y + dy * t;
+        blend_pixel(
+            buffer,
+            width,
+            height,
+            x.round() as isize,
+            y.round() as isize,
+            color,
+        );
+    }
+}
+
+fn blend_pixel(buffer: &mut [u8], width: usize, height: usize, x: isize, y: isize, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+        return;
+    }
+    let idx = ((y as usize * width) + x as usize) * 4;
+    let alpha = color[3] as f32 / 255.0;
+    let inv_alpha = 1.0 - alpha;
+    buffer[idx] = (color[0] as f32 * alpha + buffer[idx] as f32 * inv_alpha).round() as u8;
+    buffer[idx + 1] = (color[1] as f32 * alpha + buffer[idx + 1] as f32 * inv_alpha).round() as u8;
+    buffer[idx + 2] = (color[2] as f32 * alpha + buffer[idx + 2] as f32 * inv_alpha).round() as u8;
+    buffer[idx + 3] =
+        ((alpha + (buffer[idx + 3] as f32 / 255.0) * inv_alpha) * 255.0).round() as u8;
 }
 
 fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
