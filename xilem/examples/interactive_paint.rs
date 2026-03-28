@@ -25,13 +25,18 @@ use xilem_core::{Edit, MessageResult};
 const CANVAS_WIDTH: f64 = 920.0;
 const CANVAS_HEIGHT: f64 = 620.0;
 const HANDLE_RADIUS: f64 = 8.0;
+const BASELINE_RADIUS: f64 = HANDLE_RADIUS + 1.5;
+const NESTED_ENDPOINT_RADIUS: f64 = 4.5;
 const HIT_RADIUS: f64 = 14.0;
 const MIN_SEGMENT_LENGTH: f64 = 2.5;
 const RENDER_BATCH_BUDGET: Duration = Duration::from_millis(5);
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug)]
 struct FractalGeometry {
     generator_points: Vec<(f64, f64)>,
+    baseline_points: [(f64, f64); 2],
+    endpoint_docked: [bool; 2],
 }
 
 impl FractalGeometry {
@@ -44,6 +49,8 @@ impl FractalGeometry {
                 (360.0, 150.0),
                 (460.0, 150.0),
             ],
+            baseline_points: [(160.0, 150.0), (460.0, 150.0)],
+            endpoint_docked: [true, true],
         }
     }
 
@@ -57,6 +64,8 @@ impl FractalGeometry {
                 (415.0, 165.0),
                 (480.0, 145.0),
             ],
+            baseline_points: [(170.0, 150.0), (480.0, 145.0)],
+            endpoint_docked: [true, true],
         }
     }
 
@@ -71,14 +80,13 @@ impl FractalGeometry {
                 (455.0, 155.0),
                 (530.0, 155.0),
             ],
+            baseline_points: [(170.0, 155.0), (530.0, 155.0)],
+            endpoint_docked: [true, true],
         }
     }
 
     fn baseline(&self) -> [(f64, f64); 2] {
-        [
-            self.generator_points[0],
-            self.generator_points[self.generator_points.len() - 1],
-        ]
+        self.baseline_points
     }
 }
 
@@ -146,6 +154,7 @@ struct SegmentJob {
 
 #[derive(Clone, Debug)]
 enum DragTarget {
+    EndpointEditor(usize),
     GeneratorPoint(usize),
     BasePoint(usize),
     GeneratorShape,
@@ -159,6 +168,8 @@ struct CanvasWidget {
     drag_target: Option<DragTarget>,
     drag_anchor: Option<Point>,
     drag_start_geometry: Option<FractalGeometry>,
+    endpoint_revealed: [bool; 2],
+    last_click: Option<(usize, Instant, Point)>,
     pending_segments: VecDeque<SegmentJob>,
     raster_buffer: Vec<u8>,
 }
@@ -250,6 +261,26 @@ impl Widget for CanvasWidget {
         match event {
             PointerEvent::Down(e) => {
                 let local_pos = ctx.local_position(e.state.position);
+                if let Some(base_index) = self.baseline_hit(local_pos) {
+                    let now = Instant::now();
+                    if self.geometry.endpoint_docked[base_index]
+                        && matches!(
+                            self.last_click,
+                            Some((last_index, last_time, last_pos))
+                                if last_index == base_index
+                                    && now.duration_since(last_time) <= DOUBLE_CLICK_THRESHOLD
+                                    && distance(local_pos, last_pos) <= HIT_RADIUS
+                        )
+                    {
+                        self.endpoint_revealed[base_index] = !self.endpoint_revealed[base_index];
+                        self.last_click = None;
+                        ctx.request_paint_only();
+                        return;
+                    }
+                    self.last_click = Some((base_index, now, local_pos));
+                } else {
+                    self.last_click = None;
+                }
                 if let Some(target) = self.hit_test(local_pos) {
                     ctx.capture_pointer();
                     self.drag_target = Some(target);
@@ -340,12 +371,11 @@ impl Widget for CanvasWidget {
         });
         scene.draw_image(&image, Affine::IDENTITY);
 
+        paint_baseline_line(scene, self.geometry.baseline());
         if self.show_guides {
-            paint_generator_guides(scene, &self.geometry.generator_points);
-            paint_baseline(scene, self.geometry.baseline());
-        } else {
-            paint_baseline(scene, self.geometry.baseline());
+            paint_generator_guides(scene, &self.geometry, self.endpoint_revealed);
         }
+        paint_baseline_handles(scene, &self.geometry, self.endpoint_revealed);
     }
 }
 
@@ -364,14 +394,33 @@ impl CanvasWidget {
     }
 
     fn hit_test(&self, point: Point) -> Option<DragTarget> {
-        for (index, handle) in self.geometry.generator_points.iter().enumerate() {
-            if distance(point, (*handle).into()) <= HIT_RADIUS {
-                return Some(DragTarget::GeneratorPoint(index));
+        for base_index in 0..2 {
+            if let Some(handle) = self.revealed_endpoint_handle(base_index) {
+                if distance(point, handle) <= NESTED_ENDPOINT_RADIUS + 3.0 {
+                    return Some(DragTarget::EndpointEditor(base_index));
+                }
             }
         }
         for (index, handle) in self.geometry.baseline().iter().enumerate() {
-            if distance(point, (*handle).into()) <= HIT_RADIUS {
+            let dist = distance(point, (*handle).into());
+            let nested_claims_center =
+                self.geometry.endpoint_docked[index] && self.endpoint_revealed[index];
+            if dist <= BASELINE_RADIUS
+                && (!nested_claims_center || dist > NESTED_ENDPOINT_RADIUS + 2.0)
+            {
                 return Some(DragTarget::BasePoint(index));
+            }
+        }
+        for (index, handle) in self.geometry.generator_points.iter().enumerate() {
+            if (index == 0 && self.geometry.endpoint_docked[0] && !self.endpoint_revealed[0])
+                || (index == self.geometry.generator_points.len() - 1
+                    && self.geometry.endpoint_docked[1]
+                    && !self.endpoint_revealed[1])
+            {
+                continue;
+            }
+            if distance(point, (*handle).into()) <= HIT_RADIUS {
+                return Some(DragTarget::GeneratorPoint(index));
             }
         }
         if point_near_polyline(point, &self.geometry.generator_points, HIT_RADIUS) {
@@ -382,6 +431,29 @@ impl CanvasWidget {
             return Some(DragTarget::Baseline);
         }
         None
+    }
+
+    fn baseline_hit(&self, point: Point) -> Option<usize> {
+        self.geometry
+            .baseline()
+            .iter()
+            .enumerate()
+            .find_map(|(index, handle)| {
+                (distance(point, (*handle).into()) <= HIT_RADIUS).then_some(index)
+            })
+    }
+
+    fn revealed_endpoint_handle(&self, base_index: usize) -> Option<Point> {
+        if !self.endpoint_revealed[base_index] {
+            return None;
+        }
+        let point_index = if base_index == 0 {
+            0
+        } else {
+            self.geometry.generator_points.len() - 1
+        };
+        let point = self.geometry.generator_points[point_index];
+        Some(point.into())
     }
 }
 
@@ -405,6 +477,8 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             drag_target: None,
             drag_anchor: None,
             drag_start_geometry: None,
+            endpoint_revealed: [false, false],
+            last_click: None,
             pending_segments: VecDeque::new(),
             raster_buffer: vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
         };
@@ -421,11 +495,14 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
     ) {
         let needs_reset = element.widget.geometry.generator_points
             != app_state.geometry.generator_points
+            || element.widget.geometry.baseline_points != app_state.geometry.baseline_points
+            || element.widget.geometry.endpoint_docked != app_state.geometry.endpoint_docked
             || element.widget.depth != app_state.depth;
         element.widget.geometry = app_state.geometry.clone();
         element.widget.depth = app_state.depth;
         element.widget.show_guides = app_state.show_guides;
         if needs_reset {
+            element.widget.endpoint_revealed = [false, false];
             element.widget.reset_render_progress();
             element.ctx.request_anim_frame();
         }
@@ -550,18 +627,31 @@ fn apply_drag(
     let mut geometry = start_geometry.clone();
     let baseline = start_geometry.baseline();
     match *target {
+        DragTarget::EndpointEditor(base_index) => {
+            let point_index = if base_index == 0 {
+                0
+            } else {
+                geometry.generator_points.len() - 1
+            };
+            geometry.generator_points[point_index].0 += delta.x;
+            geometry.generator_points[point_index].1 += delta.y;
+            if distance(
+                geometry.generator_points[point_index].into(),
+                geometry.baseline_points[base_index].into(),
+            ) <= BASELINE_RADIUS
+            {
+                geometry.generator_points[point_index] = geometry.baseline_points[base_index];
+                geometry.endpoint_docked[base_index] = true;
+            } else {
+                geometry.endpoint_docked[base_index] = false;
+            }
+        }
         DragTarget::GeneratorPoint(index) => {
             if index == 0 || index == geometry.generator_points.len() - 1 {
-                let mut new_baseline = baseline;
-                new_baseline[if index == 0 { 0 } else { 1 }] = (
-                    baseline[if index == 0 { 0 } else { 1 }].0 + delta.x,
-                    baseline[if index == 0 { 0 } else { 1 }].1 + delta.y,
-                );
-                geometry.generator_points = transform_points_between_baselines(
-                    &start_geometry.generator_points,
-                    baseline,
-                    new_baseline,
-                );
+                let base_index = if index == 0 { 0 } else { 1 };
+                geometry.generator_points[index].0 += delta.x;
+                geometry.generator_points[index].1 += delta.y;
+                geometry.endpoint_docked[base_index] = false;
             } else if let Some(point) = geometry.generator_points.get_mut(index) {
                 point.0 += delta.x;
                 point.1 += delta.y;
@@ -570,20 +660,41 @@ fn apply_drag(
         DragTarget::BasePoint(index) => {
             let mut new_baseline = baseline;
             new_baseline[index] = (baseline[index].0 + delta.x, baseline[index].1 + delta.y);
+            geometry.baseline_points = new_baseline;
             geometry.generator_points = transform_points_between_baselines(
                 &start_geometry.generator_points,
                 baseline,
                 new_baseline,
             );
+            sync_docked_endpoints(&mut geometry);
         }
         DragTarget::GeneratorShape | DragTarget::Baseline => {
             for point in &mut geometry.generator_points {
                 point.0 += delta.x;
                 point.1 += delta.y;
             }
+            if matches!(*target, DragTarget::Baseline) {
+                for point in &mut geometry.baseline_points {
+                    point.0 += delta.x;
+                    point.1 += delta.y;
+                }
+                sync_docked_endpoints(&mut geometry);
+            } else {
+                geometry.endpoint_docked = [false, false];
+            }
         }
     }
     geometry
+}
+
+fn sync_docked_endpoints(geometry: &mut FractalGeometry) {
+    if geometry.endpoint_docked[0] {
+        geometry.generator_points[0] = geometry.baseline_points[0];
+    }
+    if geometry.endpoint_docked[1] {
+        let last = geometry.generator_points.len() - 1;
+        geometry.generator_points[last] = geometry.baseline_points[1];
+    }
 }
 
 fn transform_points_between_baselines(
@@ -642,7 +753,12 @@ fn map_local(start: Point, end: Point, local: (f64, f64)) -> Point {
     start + direction * local.0 + perpendicular * local.1
 }
 
-fn paint_generator_guides(scene: &mut Scene, points: &[(f64, f64)]) {
+fn paint_generator_guides(
+    scene: &mut Scene,
+    geometry: &FractalGeometry,
+    endpoint_revealed: [bool; 2],
+) {
+    let points = &geometry.generator_points;
     if points.len() >= 2 {
         let mut path = BezPath::new();
         path.move_to(Point::new(points[0].0, points[0].1));
@@ -658,16 +774,22 @@ fn paint_generator_guides(scene: &mut Scene, points: &[(f64, f64)]) {
         );
     }
 
-    for &(x, y) in points {
-        fill(
-            scene,
-            &Circle::new((x, y), HANDLE_RADIUS),
-            Color::from_rgb8(215, 83, 63),
-        );
+    for (index, &(x, y)) in points.iter().enumerate() {
+        let is_endpoint = index == 0 || index == points.len() - 1;
+        let slot = if index == 0 { 0 } else { 1 };
+        if is_endpoint && geometry.endpoint_docked[slot] {
+            paint_docked_endpoint(scene, Point::new(x, y), endpoint_revealed[slot]);
+        } else {
+            fill(
+                scene,
+                &Circle::new((x, y), HANDLE_RADIUS),
+                Color::from_rgb8(215, 83, 63),
+            );
+        }
     }
 }
 
-fn paint_baseline(scene: &mut Scene, base_line: [(f64, f64); 2]) {
+fn paint_baseline_line(scene: &mut Scene, base_line: [(f64, f64); 2]) {
     scene.stroke(
         &Stroke::new(3.0),
         Affine::IDENTITY,
@@ -675,12 +797,23 @@ fn paint_baseline(scene: &mut Scene, base_line: [(f64, f64); 2]) {
         None,
         &Line::new(base_line[0], base_line[1]),
     );
-    for point in base_line {
-        fill(
-            scene,
-            &Circle::new(point, HANDLE_RADIUS + 1.5),
-            Color::from_rgb8(87, 140, 201),
-        );
+}
+
+fn paint_baseline_handles(
+    scene: &mut Scene,
+    geometry: &FractalGeometry,
+    endpoint_revealed: [bool; 2],
+) {
+    for (index, point) in geometry.baseline().into_iter().enumerate() {
+        if geometry.endpoint_docked[index] {
+            paint_docked_endpoint(scene, point.into(), endpoint_revealed[index]);
+        } else {
+            fill(
+                scene,
+                &Circle::new(point, BASELINE_RADIUS),
+                Color::from_rgb8(87, 140, 201),
+            );
+        }
     }
 }
 
@@ -707,6 +840,29 @@ fn distance(a: Point, b: Point) -> f64 {
 
 fn cross(a: Vec2, b: Vec2) -> f64 {
     a.x * b.y - a.y * b.x
+}
+
+fn paint_docked_endpoint(scene: &mut Scene, center: Point, red_active: bool) {
+    let outer_radius = BASELINE_RADIUS;
+    let inner_radius = NESTED_ENDPOINT_RADIUS;
+    let blue = Color::from_rgb8(87, 140, 201);
+    let red = Color::from_rgb8(184, 49, 90);
+
+    let (outer_color, inner_color, ring_color) = if red_active {
+        (blue, red, Color::from_rgb8(230, 238, 250))
+    } else {
+        (red, blue, Color::from_rgb8(250, 227, 235))
+    };
+
+    fill(scene, &Circle::new(center, outer_radius), outer_color);
+    scene.stroke(
+        &Stroke::new(1.0),
+        Affine::IDENTITY,
+        ring_color,
+        None,
+        &Circle::new(center, outer_radius),
+    );
+    fill(scene, &Circle::new(center, inner_radius), inner_color);
 }
 
 fn rasterize_line(
