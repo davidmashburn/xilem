@@ -187,7 +187,10 @@ impl Widget for CanvasWidget {
             return;
         }
 
-        let local_points = normalized_points(&self.geometry.generator_points);
+        let local_points = normalized_points_from_baseline(
+            &self.geometry.generator_points,
+            self.geometry.baseline(),
+        );
         let deadline = Instant::now() + RENDER_BATCH_BUDGET;
         while Instant::now() < deadline {
             let Some(job) = self.pending_segments.pop_back() else {
@@ -955,6 +958,18 @@ mod tests {
         assert!((local[0].0 - 0.0).abs() < 1e-9);
         assert!((local[0].1 - 0.0).abs() < 1e-9);
         assert!((local[2].0 - 1.0).abs() < 1e-9);
+        assert!((local[2].1 - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalized_points_can_use_baseline_distinct_from_red_endpoints() {
+        let points = vec![(10.0, 10.0), (20.0, 30.0), (40.0, 10.0)];
+        let baseline = [(0.0, 10.0), (50.0, 10.0)];
+        let local = normalized_points_from_baseline(&points, baseline);
+
+        assert!((local[0].0 - 0.2).abs() < 1e-9);
+        assert!((local[0].1 - 0.0).abs() < 1e-9);
+        assert!((local[2].0 - 0.8).abs() < 1e-9);
         assert!((local[2].1 - 0.0).abs() < 1e-9);
     }
 
