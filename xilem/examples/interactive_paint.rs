@@ -3,6 +3,9 @@
 
 //! Interactive line fractal explorer built with a custom paint widget.
 
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
 use masonry::peniko::Fill;
@@ -14,8 +17,8 @@ use masonry_winit::app::{EventLoop, EventLoopBuilder};
 use winit::error::EventLoopError;
 use xilem::core::{Arg, MessageContext, Mut, View, ViewMarker};
 use xilem::style::Style;
-use xilem::view::{checkbox, flex_col, flex_row, label, sized_box, slider, text_button};
-use xilem::{Color, Pod, ViewCtx, WidgetView, WindowOptions, Xilem};
+use xilem::view::{checkbox, flex_col, flex_row, label, sized_box, text_button, text_input};
+use xilem::{Color, Pod, TextAlign, ViewCtx, WidgetView, WindowOptions, Xilem};
 use xilem_core::{Edit, MessageResult};
 
 const CANVAS_WIDTH: f64 = 920.0;
@@ -23,12 +26,11 @@ const CANVAS_HEIGHT: f64 = 620.0;
 const HANDLE_RADIUS: f64 = 8.0;
 const HIT_RADIUS: f64 = 14.0;
 const MIN_SEGMENT_LENGTH: f64 = 2.5;
-const MAX_SEGMENTS: usize = 40_000;
+const RENDER_BATCH_BUDGET: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug)]
 struct FractalGeometry {
     generator_points: Vec<(f64, f64)>,
-    base_line: [(f64, f64); 2],
 }
 
 impl FractalGeometry {
@@ -41,7 +43,6 @@ impl FractalGeometry {
                 (360.0, 150.0),
                 (460.0, 150.0),
             ],
-            base_line: [(120.0, 490.0), (800.0, 490.0)],
         }
     }
 
@@ -55,7 +56,6 @@ impl FractalGeometry {
                 (415.0, 165.0),
                 (480.0, 145.0),
             ],
-            base_line: [(120.0, 500.0), (810.0, 470.0)],
         }
     }
 
@@ -70,14 +70,21 @@ impl FractalGeometry {
                 (455.0, 155.0),
                 (530.0, 155.0),
             ],
-            base_line: [(110.0, 505.0), (820.0, 505.0)],
         }
+    }
+
+    fn baseline(&self) -> [(f64, f64); 2] {
+        [
+            self.generator_points[0],
+            self.generator_points[self.generator_points.len() - 1],
+        ]
     }
 }
 
 #[derive(Debug)]
 struct InteractivePaintApp {
     depth: usize,
+    depth_input: String,
     show_guides: bool,
     geometry: FractalGeometry,
     preset_name: &'static str,
@@ -87,6 +94,7 @@ impl Default for InteractivePaintApp {
     fn default() -> Self {
         Self {
             depth: 5,
+            depth_input: "5".to_string(),
             show_guides: true,
             geometry: FractalGeometry::koch(),
             preset_name: "Koch-ish",
@@ -100,26 +108,39 @@ impl InteractivePaintApp {
         self.geometry = geometry;
     }
 
+    fn set_depth(&mut self, depth: usize) {
+        self.depth = depth;
+        self.depth_input = self.depth.to_string();
+    }
+
     fn branch_factor(&self) -> usize {
         self.geometry.generator_points.len().saturating_sub(1)
     }
 
-    fn estimated_segments(&self) -> usize {
-        let mut total = 1usize;
+    fn estimated_segments_label(&self) -> String {
         let branch_factor = self.branch_factor().max(1);
-        for _ in 0..self.depth {
-            total = total.saturating_mul(branch_factor);
-            if total >= MAX_SEGMENTS {
-                return MAX_SEGMENTS;
-            }
+        let mut total = 1u128;
+        for _ in 0..self.depth.min(64) {
+            total = total.saturating_mul(branch_factor as u128);
         }
-        total
+        if self.depth > 64 || total > 999_999_999_999 {
+            "Segments: huge".to_string()
+        } else {
+            format!("Segments: {total}")
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 enum CanvasAction {
     Geometry(FractalGeometry),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SegmentJob {
+    start: Point,
+    end: Point,
+    depth: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -137,10 +158,50 @@ struct CanvasWidget {
     drag_target: Option<DragTarget>,
     drag_anchor: Option<Point>,
     drag_start_geometry: Option<FractalGeometry>,
+    pending_segments: VecDeque<SegmentJob>,
+    rendered_segments: Vec<(Point, Point)>,
 }
 
 impl Widget for CanvasWidget {
     type Action = CanvasAction;
+
+    fn on_anim_frame(
+        &mut self,
+        ctx: &mut UpdateCtx<'_>,
+        _: &mut PropertiesMut<'_>,
+        _interval: u64,
+    ) {
+        if self.pending_segments.is_empty() {
+            return;
+        }
+
+        let local_points = normalized_points(&self.geometry.generator_points);
+        let deadline = Instant::now() + RENDER_BATCH_BUDGET;
+        while Instant::now() < deadline {
+            let Some(job) = self.pending_segments.pop_back() else {
+                break;
+            };
+            if job.depth == 0
+                || distance(job.start, job.end) <= MIN_SEGMENT_LENGTH
+                || local_points.len() < 2
+            {
+                self.rendered_segments.push((job.start, job.end));
+                continue;
+            }
+            for pair in local_points.windows(2).rev() {
+                self.pending_segments.push_back(SegmentJob {
+                    start: map_local(job.start, job.end, pair[0]),
+                    end: map_local(job.start, job.end, pair[1]),
+                    depth: job.depth - 1,
+                });
+            }
+        }
+
+        if !self.pending_segments.is_empty() {
+            ctx.request_anim_frame();
+        }
+        ctx.request_paint_only();
+    }
 
     fn register_children(&mut self, _: &mut RegisterCtx<'_>) {}
 
@@ -219,6 +280,14 @@ impl Widget for CanvasWidget {
         }
     }
 
+    fn update(&mut self, ctx: &mut UpdateCtx<'_>, _: &mut PropertiesMut<'_>, event: &Update) {
+        if matches!(event, Update::WidgetAdded) {
+            self.reset_render_progress();
+            ctx.request_anim_frame();
+            ctx.request_paint_only();
+        }
+    }
+
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, scene: &mut Scene) {
         let rect = ctx.size().to_rect();
         fill(scene, &rect, Color::from_rgb8(246, 242, 233));
@@ -239,34 +308,46 @@ impl Widget for CanvasWidget {
             &preview_rect,
         );
 
-        let local_points = normalized_points(&self.geometry.generator_points);
-        let mut remaining_segments = MAX_SEGMENTS;
-        draw_fractal(
-            scene,
-            &local_points,
-            self.geometry.base_line[0].into(),
-            self.geometry.base_line[1].into(),
-            self.depth,
-            &mut remaining_segments,
-        );
+        for &(start, end) in &self.rendered_segments {
+            scene.stroke(
+                &Stroke::new(1.15),
+                Affine::IDENTITY,
+                Color::from_rgb8(28, 96, 99),
+                None,
+                &Line::new(start, end),
+            );
+        }
 
         if self.show_guides {
             paint_generator_guides(scene, &self.geometry.generator_points);
-            paint_baseline(scene, self.geometry.base_line);
+            paint_baseline(scene, self.geometry.baseline());
         } else {
-            paint_baseline(scene, self.geometry.base_line);
+            paint_baseline(scene, self.geometry.baseline());
         }
     }
 }
 
 impl CanvasWidget {
+    fn reset_render_progress(&mut self) {
+        self.rendered_segments.clear();
+        self.pending_segments.clear();
+        if self.geometry.generator_points.len() >= 2 {
+            let baseline = self.geometry.baseline();
+            self.pending_segments.push_back(SegmentJob {
+                start: baseline[0].into(),
+                end: baseline[1].into(),
+                depth: self.depth,
+            });
+        }
+    }
+
     fn hit_test(&self, point: Point) -> Option<DragTarget> {
         for (index, handle) in self.geometry.generator_points.iter().enumerate() {
             if distance(point, (*handle).into()) <= HIT_RADIUS {
                 return Some(DragTarget::GeneratorPoint(index));
             }
         }
-        for (index, handle) in self.geometry.base_line.iter().enumerate() {
+        for (index, handle) in self.geometry.baseline().iter().enumerate() {
             if distance(point, (*handle).into()) <= HIT_RADIUS {
                 return Some(DragTarget::BasePoint(index));
             }
@@ -274,12 +355,8 @@ impl CanvasWidget {
         if point_near_polyline(point, &self.geometry.generator_points, HIT_RADIUS) {
             return Some(DragTarget::GeneratorShape);
         }
-        if point_to_segment_distance(
-            point,
-            self.geometry.base_line[0].into(),
-            self.geometry.base_line[1].into(),
-        ) <= HIT_RADIUS
-        {
+        let baseline = self.geometry.baseline();
+        if point_to_segment_distance(point, baseline[0].into(), baseline[1].into()) <= HIT_RADIUS {
             return Some(DragTarget::Baseline);
         }
         None
@@ -306,6 +383,8 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             drag_target: None,
             drag_anchor: None,
             drag_start_geometry: None,
+            pending_segments: VecDeque::new(),
+            rendered_segments: Vec::new(),
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
@@ -318,9 +397,16 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         mut element: Mut<'_, Self::Element>,
         app_state: Arg<'_, Edit<InteractivePaintApp>>,
     ) {
+        let needs_reset = element.widget.geometry.generator_points
+            != app_state.geometry.generator_points
+            || element.widget.depth != app_state.depth;
         element.widget.geometry = app_state.geometry.clone();
         element.widget.depth = app_state.depth;
         element.widget.show_guides = app_state.show_guides;
+        if needs_reset {
+            element.widget.reset_render_progress();
+            element.ctx.request_anim_frame();
+        }
         element.ctx.request_paint_only();
     }
 
@@ -358,19 +444,12 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
 }
 
 fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<InteractivePaintApp>> + use<> {
-    let estimated_segments = data.estimated_segments();
-    let segment_label = if estimated_segments >= MAX_SEGMENTS {
-        format!("Segments: {}+", MAX_SEGMENTS)
-    } else {
-        format!("Segments: {estimated_segments}")
-    };
-
     flex_col((
         label("Line Fractal Explorer").text_size(26.0),
         flex_row((
             label(format!("Preset: {}", data.preset_name)),
             label(format!("Depth: {}", data.depth)),
-            label(segment_label),
+            label(data.estimated_segments_label()),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center)
         .gap(18.0.px()),
@@ -398,10 +477,34 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
         .gap(12.0.px()),
         flex_row((
             sized_box(label("Depth")).width(48.px()),
-            slider(0.0, 7.0, data.depth as f64, |data: &mut InteractivePaintApp, value| {
-                data.depth = value.round().clamp(0.0, 7.0) as usize;
-            })
-            .step(1.0),
+            text_button("-", |data: &mut InteractivePaintApp| {
+                data.set_depth(data.depth.saturating_sub(1));
+            }),
+            sized_box(
+                text_input(
+                    data.depth_input.clone(),
+                    |data: &mut InteractivePaintApp, value| {
+                        let trimmed = value.trim();
+                        if let Ok(parsed) = trimmed.parse::<usize>() {
+                            data.set_depth(parsed);
+                        } else {
+                            data.depth_input = value;
+                        }
+                    },
+                )
+                .on_enter(|data: &mut InteractivePaintApp, value| {
+                    if let Ok(parsed) = value.trim().parse::<usize>() {
+                        data.set_depth(parsed);
+                    } else {
+                        data.depth_input = data.depth.to_string();
+                    }
+                })
+                .text_alignment(TextAlign::Center),
+            )
+            .width(80.px()),
+            text_button("+", |data: &mut InteractivePaintApp| {
+                data.set_depth(data.depth.saturating_add(1));
+            }),
             checkbox("Show guides", data.show_guides, |data: &mut InteractivePaintApp, checked| {
                 data.show_guides = checked;
             }),
@@ -423,25 +526,36 @@ fn apply_drag(
     delta: Vec2,
 ) -> FractalGeometry {
     let mut geometry = start_geometry.clone();
+    let baseline = start_geometry.baseline();
     match *target {
         DragTarget::GeneratorPoint(index) => {
-            if let Some(point) = geometry.generator_points.get_mut(index) {
+            if index == 0 || index == geometry.generator_points.len() - 1 {
+                let mut new_baseline = baseline;
+                new_baseline[if index == 0 { 0 } else { 1 }] = (
+                    baseline[if index == 0 { 0 } else { 1 }].0 + delta.x,
+                    baseline[if index == 0 { 0 } else { 1 }].1 + delta.y,
+                );
+                geometry.generator_points = transform_points_between_baselines(
+                    &start_geometry.generator_points,
+                    baseline,
+                    new_baseline,
+                );
+            } else if let Some(point) = geometry.generator_points.get_mut(index) {
                 point.0 += delta.x;
                 point.1 += delta.y;
             }
         }
         DragTarget::BasePoint(index) => {
-            geometry.base_line[index].0 += delta.x;
-            geometry.base_line[index].1 += delta.y;
+            let mut new_baseline = baseline;
+            new_baseline[index] = (baseline[index].0 + delta.x, baseline[index].1 + delta.y);
+            geometry.generator_points = transform_points_between_baselines(
+                &start_geometry.generator_points,
+                baseline,
+                new_baseline,
+            );
         }
-        DragTarget::GeneratorShape => {
+        DragTarget::GeneratorShape | DragTarget::Baseline => {
             for point in &mut geometry.generator_points {
-                point.0 += delta.x;
-                point.1 += delta.y;
-            }
-        }
-        DragTarget::Baseline => {
-            for point in &mut geometry.base_line {
                 point.0 += delta.x;
                 point.1 += delta.y;
             }
@@ -450,13 +564,39 @@ fn apply_drag(
     geometry
 }
 
+fn transform_points_between_baselines(
+    points: &[(f64, f64)],
+    old_baseline: [(f64, f64); 2],
+    new_baseline: [(f64, f64); 2],
+) -> Vec<(f64, f64)> {
+    let local_points = normalized_points_from_baseline(points, old_baseline);
+    local_points
+        .into_iter()
+        .map(|local| {
+            let mapped = map_local(new_baseline[0].into(), new_baseline[1].into(), local);
+            (mapped.x, mapped.y)
+        })
+        .collect()
+}
+
 fn normalized_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
     if points.len() < 2 {
         return vec![(0.0, 0.0), (1.0, 0.0)];
     }
 
-    let start = Point::new(points[0].0, points[0].1);
-    let end = Point::new(points[points.len() - 1].0, points[points.len() - 1].1);
+    normalized_points_from_baseline(points, [points[0], points[points.len() - 1]])
+}
+
+fn normalized_points_from_baseline(
+    points: &[(f64, f64)],
+    baseline: [(f64, f64); 2],
+) -> Vec<(f64, f64)> {
+    if points.len() < 2 {
+        return vec![(0.0, 0.0), (1.0, 0.0)];
+    }
+
+    let start = Point::new(baseline[0].0, baseline[0].1);
+    let end = Point::new(baseline[1].0, baseline[1].1);
     let line = end - start;
     let length_sq = line.hypot2();
     if length_sq <= f64::EPSILON {
@@ -472,47 +612,6 @@ fn normalized_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
             (local_x, local_y)
         })
         .collect()
-}
-
-fn draw_fractal(
-    scene: &mut Scene,
-    local_points: &[(f64, f64)],
-    start: Point,
-    end: Point,
-    depth: usize,
-    remaining_segments: &mut usize,
-) {
-    if *remaining_segments == 0 {
-        return;
-    }
-
-    if depth == 0 || distance(start, end) <= MIN_SEGMENT_LENGTH || local_points.len() < 2 {
-        scene.stroke(
-            &Stroke::new(1.15),
-            Affine::IDENTITY,
-            Color::from_rgb8(28, 96, 99),
-            None,
-            &Line::new(start, end),
-        );
-        *remaining_segments = remaining_segments.saturating_sub(1);
-        return;
-    }
-
-    for pair in local_points.windows(2) {
-        if *remaining_segments == 0 {
-            return;
-        }
-        let child_start = map_local(start, end, pair[0]);
-        let child_end = map_local(start, end, pair[1]);
-        draw_fractal(
-            scene,
-            local_points,
-            child_start,
-            child_end,
-            depth - 1,
-            remaining_segments,
-        );
-    }
 }
 
 fn map_local(start: Point, end: Point, local: (f64, f64)) -> Point {
@@ -655,6 +754,27 @@ mod tests {
                 geometry.generator_points[0].1 - 5.0
             )
         );
-        assert_eq!(moved.base_line, geometry.base_line);
+        assert_eq!(
+            moved.generator_points[moved.generator_points.len() - 1],
+            (
+                geometry.generator_points[geometry.generator_points.len() - 1].0 + 10.0,
+                geometry.generator_points[geometry.generator_points.len() - 1].1 - 5.0
+            )
+        );
+    }
+
+    #[test]
+    fn dragging_display_endpoint_transforms_interior_control_points() {
+        let geometry = FractalGeometry::koch();
+        let moved = apply_drag(&geometry, &DragTarget::BasePoint(0), Vec2::new(20.0, 30.0));
+
+        assert_eq!(
+            moved.baseline()[0],
+            (
+                geometry.baseline()[0].0 + 20.0,
+                geometry.baseline()[0].1 + 30.0
+            )
+        );
+        assert_ne!(moved.generator_points[1], geometry.generator_points[1]);
     }
 }
