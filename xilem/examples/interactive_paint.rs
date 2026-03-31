@@ -153,6 +153,12 @@ struct SegmentJob {
     depth: usize,
 }
 
+struct BenchmarkStats {
+    elapsed: Duration,
+    expanded_jobs: u128,
+    rasterized_lines: u128,
+}
+
 #[derive(Clone, Debug)]
 enum DragTarget {
     EndpointEditor(usize),
@@ -197,10 +203,7 @@ impl Widget for CanvasWidget {
             let Some(job) = self.pending_segments.pop_back() else {
                 break;
             };
-            if job.depth == 0
-                || distance(job.start, job.end) <= MIN_SEGMENT_LENGTH
-                || local_points.len() < 2
-            {
+            if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
                 rasterize_line(
                     &mut self.raster_buffer,
                     CANVAS_WIDTH as usize,
@@ -765,6 +768,10 @@ fn map_local(start: Point, end: Point, local: (f64, f64)) -> Point {
     start + direction * local.0 + perpendicular * local.1
 }
 
+fn segment_too_small(start: Point, end: Point) -> bool {
+    (end - start).hypot2() <= MIN_SEGMENT_LENGTH * MIN_SEGMENT_LENGTH
+}
+
 fn paint_generator_guides(
     scene: &mut Scene,
     geometry: &FractalGeometry,
@@ -929,17 +936,16 @@ fn blend_pixel(buffer: &mut [u8], width: usize, height: usize, x: isize, y: isiz
         ((alpha + (buffer[idx + 3] as f32 / 255.0) * inv_alpha) * 255.0).round() as u8;
 }
 
-fn benchmark_rasterize(depth: usize) -> Duration {
+fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkStats {
     let width = CANVAS_WIDTH as usize;
     let height = CANVAS_HEIGHT as usize;
     let mut buffer = vec![0u8; width * height * 4];
-    let geometry = FractalGeometry::koch();
     let baseline = geometry.baseline();
 
     let local_points = normalized_points_from_baseline(&geometry.generator_points, baseline);
-    let mut pending_segments: VecDeque<SegmentJob> = VecDeque::new();
+    let mut pending_segments: Vec<SegmentJob> = Vec::new();
     if geometry.generator_points.len() >= 2 {
-        pending_segments.push_back(SegmentJob {
+        pending_segments.push(SegmentJob {
             start: baseline[0].into(),
             end: baseline[1].into(),
             depth,
@@ -947,11 +953,12 @@ fn benchmark_rasterize(depth: usize) -> Duration {
     }
 
     let start = Instant::now();
-    while let Some(job) = pending_segments.pop_front() {
-        if job.depth == 0
-            || distance(job.start, job.end) <= MIN_SEGMENT_LENGTH
-            || local_points.len() < 2
-        {
+    let mut expanded_jobs = 0u128;
+    let mut rasterized_lines = 0u128;
+    while let Some(job) = pending_segments.pop() {
+        expanded_jobs += 1;
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
+            rasterized_lines += 1;
             rasterize_line(
                 &mut buffer,
                 width,
@@ -961,8 +968,8 @@ fn benchmark_rasterize(depth: usize) -> Duration {
                 [28, 96, 99, 255],
             );
         } else {
-            for pair in local_points.windows(2) {
-                pending_segments.push_back(SegmentJob {
+            for pair in local_points.windows(2).rev() {
+                pending_segments.push(SegmentJob {
                     start: map_local(job.start, job.end, pair[0]),
                     end: map_local(job.start, job.end, pair[1]),
                     depth: job.depth - 1,
@@ -970,44 +977,92 @@ fn benchmark_rasterize(depth: usize) -> Duration {
             }
         }
     }
-    start.elapsed()
+    BenchmarkStats {
+        elapsed: start.elapsed(),
+        expanded_jobs,
+        rasterized_lines,
+    }
 }
 
-fn count_segments(depth: usize, branch_factor: usize) -> usize {
-    let mut total = 0;
-    let mut to_process = 1;
+fn count_leaf_segments(depth: usize, branch_factor: usize) -> u128 {
+    let mut total = 1u128;
     for _ in 0..depth {
-        total += to_process;
-        to_process *= branch_factor;
+        total = total.saturating_mul(branch_factor as u128);
     }
     total
 }
 
+fn count_total_jobs(depth: usize, branch_factor: usize) -> u128 {
+    let mut total = 0u128;
+    let mut level = 1u128;
+    for _ in 0..=depth {
+        total = total.saturating_add(level);
+        level = level.saturating_mul(branch_factor as u128);
+    }
+    total
+}
+
+fn format_u128(value: u128) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = digits.len();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push('_');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn run_benchmark() {
-    let branch_factor = 4; // Koch has 4 segments per iteration
+    let geometry = FractalGeometry::koch();
+    let branch_factor = geometry.generator_points.len().saturating_sub(1).max(1);
     println!("\n=== Rust Fractal Rasterization Benchmark ===\n");
     println!("Canvas size: {}x{}", CANVAS_WIDTH, CANVAS_HEIGHT);
     println!("Branch factor: {} segments/iteration\n", branch_factor);
 
-    for depth in [3, 5, 7, 8, 9, 10] {
-        let segments = count_segments(depth, branch_factor);
-        println!("Depth {}: {} segments", depth, segments);
+    for depth in [5, 8, 10, 12, 14, 16, 18, 20] {
+        let theoretical_lines = count_leaf_segments(depth, branch_factor);
+        let theoretical_jobs = count_total_jobs(depth, branch_factor);
+        println!(
+            "Depth {}: theoretical lines={}, total jobs={}",
+            depth,
+            format_u128(theoretical_lines),
+            format_u128(theoretical_jobs)
+        );
 
         let iterations = 5;
         let mut times = Vec::with_capacity(iterations);
+        let mut expanded_jobs = 0u128;
+        let mut rasterized_lines = 0u128;
         for _ in 0..iterations {
-            times.push(benchmark_rasterize(depth));
+            let stats = benchmark_rasterize(depth, &geometry);
+            expanded_jobs = stats.expanded_jobs;
+            rasterized_lines = stats.rasterized_lines;
+            times.push(stats.elapsed);
         }
 
         let avg = times.iter().sum::<Duration>() / iterations as u32;
         let min = times.iter().min().copied().unwrap();
         let max = times.iter().max().copied().unwrap();
+        let lines_per_sec = rasterized_lines as f64 / avg.as_secs_f64();
+        let jobs_per_sec = expanded_jobs as f64 / avg.as_secs_f64();
 
         println!(
-            "  avg={:.2}ms, min={:.2}ms, max={:.2}ms\n",
+            "  actual rasterized lines={}, expanded jobs={}",
+            format_u128(rasterized_lines),
+            format_u128(expanded_jobs)
+        );
+        println!(
+            "  avg={:.2}ms, min={:.2}ms, max={:.2}ms",
             avg.as_secs_f64() * 1000.0,
             min.as_secs_f64() * 1000.0,
             max.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  throughput: {:.0} lines/sec, {:.0} jobs/sec\n",
+            lines_per_sec, jobs_per_sec
         );
     }
 }
