@@ -27,6 +27,7 @@ const CANVAS_HEIGHT: f64 = 620.0;
 const HANDLE_RADIUS: f64 = 8.0;
 const BASELINE_RADIUS: f64 = HANDLE_RADIUS + 1.5;
 const NESTED_ENDPOINT_RADIUS: f64 = 4.5;
+const NESTED_HIT_TOLERANCE: f64 = 3.0;
 const HIT_RADIUS: f64 = 14.0;
 const MIN_SEGMENT_LENGTH: f64 = 2.5;
 const RENDER_BATCH_BUDGET: Duration = Duration::from_millis(5);
@@ -261,11 +262,17 @@ impl Widget for CanvasWidget {
         _: &mut PropertiesMut<'_>,
         event: &PointerEvent,
     ) {
+        let now = Instant::now();
+        if let Some((_, last_time, _)) = self.last_click {
+            if now.duration_since(last_time) > DOUBLE_CLICK_THRESHOLD {
+                self.last_click = None;
+            }
+        }
+
         match event {
             PointerEvent::Down(e) => {
                 let local_pos = ctx.local_position(e.state.position);
                 if let Some(base_index) = self.baseline_hit(local_pos) {
-                    let now = Instant::now();
                     if self.geometry.endpoint_docked[base_index]
                         && matches!(
                             self.last_click,
@@ -399,7 +406,7 @@ impl CanvasWidget {
     fn hit_test(&self, point: Point) -> Option<DragTarget> {
         for base_index in 0..2 {
             if let Some(handle) = self.revealed_endpoint_handle(base_index) {
-                if distance(point, handle) <= NESTED_ENDPOINT_RADIUS + 3.0 {
+                if distance(point, handle) <= NESTED_ENDPOINT_RADIUS + NESTED_HIT_TOLERANCE {
                     return Some(DragTarget::EndpointEditor(base_index));
                 }
             }
@@ -409,7 +416,8 @@ impl CanvasWidget {
             let nested_claims_center =
                 self.geometry.endpoint_docked[index] && self.endpoint_revealed[index];
             if dist <= BASELINE_RADIUS
-                && (!nested_claims_center || dist > NESTED_ENDPOINT_RADIUS + 2.0)
+                && (!nested_claims_center
+                    || dist > NESTED_ENDPOINT_RADIUS + NESTED_HIT_TOLERANCE - 1.0)
             {
                 return Some(DragTarget::BasePoint(index));
             }
@@ -496,18 +504,26 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         mut element: Mut<'_, Self::Element>,
         app_state: Arg<'_, Edit<InteractivePaintApp>>,
     ) {
-        let needs_reset = element.widget.geometry.generator_points
+        let geometry_changed = element.widget.geometry.generator_points
             != app_state.geometry.generator_points
             || element.widget.geometry.baseline_points != app_state.geometry.baseline_points
-            || element.widget.geometry.endpoint_docked != app_state.geometry.endpoint_docked
-            || element.widget.depth != app_state.depth;
-        element.widget.geometry = app_state.geometry.clone();
-        element.widget.depth = app_state.depth;
-        element.widget.show_guides = app_state.show_guides;
-        if needs_reset {
+            || element.widget.geometry.endpoint_docked != app_state.geometry.endpoint_docked;
+
+        let depth_changed = element.widget.depth != app_state.depth;
+        let guides_changed = element.widget.show_guides != app_state.show_guides;
+
+        if guides_changed {
+            element.widget.show_guides = app_state.show_guides;
+        }
+
+        if geometry_changed || depth_changed {
+            element.widget.geometry = app_state.geometry.clone();
+            element.widget.depth = app_state.depth;
             element.widget.endpoint_revealed = [false, false];
             element.widget.reset_render_progress();
             element.ctx.request_anim_frame();
+        } else {
+            return;
         }
         element.ctx.request_paint_only();
     }
@@ -655,6 +671,7 @@ fn apply_drag(
                 geometry.generator_points[index].0 += delta.x;
                 geometry.generator_points[index].1 += delta.y;
                 geometry.endpoint_docked[base_index] = false;
+                sync_docked_endpoints(&mut geometry);
             } else if let Some(point) = geometry.generator_points.get_mut(index) {
                 point.0 += delta.x;
                 point.1 += delta.y;
@@ -713,14 +730,6 @@ fn transform_points_between_baselines(
             (mapped.x, mapped.y)
         })
         .collect()
-}
-
-fn normalized_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    if points.len() < 2 {
-        return vec![(0.0, 0.0), (1.0, 0.0)];
-    }
-
-    normalized_points_from_baseline(points, [points[0], points[points.len() - 1]])
 }
 
 fn normalized_points_from_baseline(
@@ -920,6 +929,89 @@ fn blend_pixel(buffer: &mut [u8], width: usize, height: usize, x: isize, y: isiz
         ((alpha + (buffer[idx + 3] as f32 / 255.0) * inv_alpha) * 255.0).round() as u8;
 }
 
+fn benchmark_rasterize(depth: usize) -> Duration {
+    let width = CANVAS_WIDTH as usize;
+    let height = CANVAS_HEIGHT as usize;
+    let mut buffer = vec![0u8; width * height * 4];
+    let geometry = FractalGeometry::koch();
+    let baseline = geometry.baseline();
+
+    let local_points = normalized_points_from_baseline(&geometry.generator_points, baseline);
+    let mut pending_segments: VecDeque<SegmentJob> = VecDeque::new();
+    if geometry.generator_points.len() >= 2 {
+        pending_segments.push_back(SegmentJob {
+            start: baseline[0].into(),
+            end: baseline[1].into(),
+            depth,
+        });
+    }
+
+    let start = Instant::now();
+    while let Some(job) = pending_segments.pop_front() {
+        if job.depth == 0
+            || distance(job.start, job.end) <= MIN_SEGMENT_LENGTH
+            || local_points.len() < 2
+        {
+            rasterize_line(
+                &mut buffer,
+                width,
+                height,
+                job.start,
+                job.end,
+                [28, 96, 99, 255],
+            );
+        } else {
+            for pair in local_points.windows(2) {
+                pending_segments.push_back(SegmentJob {
+                    start: map_local(job.start, job.end, pair[0]),
+                    end: map_local(job.start, job.end, pair[1]),
+                    depth: job.depth - 1,
+                });
+            }
+        }
+    }
+    start.elapsed()
+}
+
+fn count_segments(depth: usize, branch_factor: usize) -> usize {
+    let mut total = 0;
+    let mut to_process = 1;
+    for _ in 0..depth {
+        total += to_process;
+        to_process *= branch_factor;
+    }
+    total
+}
+
+fn run_benchmark() {
+    let branch_factor = 4; // Koch has 4 segments per iteration
+    println!("\n=== Rust Fractal Rasterization Benchmark ===\n");
+    println!("Canvas size: {}x{}", CANVAS_WIDTH, CANVAS_HEIGHT);
+    println!("Branch factor: {} segments/iteration\n", branch_factor);
+
+    for depth in [3, 5, 7, 8, 9, 10] {
+        let segments = count_segments(depth, branch_factor);
+        println!("Depth {}: {} segments", depth, segments);
+
+        let iterations = 5;
+        let mut times = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            times.push(benchmark_rasterize(depth));
+        }
+
+        let avg = times.iter().sum::<Duration>() / iterations as u32;
+        let min = times.iter().min().copied().unwrap();
+        let max = times.iter().max().copied().unwrap();
+
+        println!(
+            "  avg={:.2}ms, min={:.2}ms, max={:.2}ms\n",
+            avg.as_secs_f64() * 1000.0,
+            min.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0
+        );
+    }
+}
+
 fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
     let data = InteractivePaintApp::default();
     let app = Xilem::new_simple(
@@ -932,6 +1024,11 @@ fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
 }
 
 fn main() -> Result<(), EventLoopError> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--benchmark".to_string()) {
+        run_benchmark();
+        return Ok(());
+    }
     run(EventLoop::with_user_event())
 }
 
@@ -949,17 +1046,6 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalized_points_keep_endpoints_at_unit_interval() {
-        let points = vec![(10.0, 10.0), (20.0, 30.0), (40.0, 10.0)];
-        let local = normalized_points(&points);
-
-        assert!((local[0].0 - 0.0).abs() < 1e-9);
-        assert!((local[0].1 - 0.0).abs() < 1e-9);
-        assert!((local[2].0 - 1.0).abs() < 1e-9);
-        assert!((local[2].1 - 0.0).abs() < 1e-9);
-    }
 
     #[test]
     fn normalized_points_can_use_baseline_distinct_from_red_endpoints() {
