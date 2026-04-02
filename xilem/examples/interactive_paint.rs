@@ -18,12 +18,16 @@ use vello::peniko::{ImageAlphaType, ImageData};
 use winit::error::EventLoopError;
 use xilem::core::{Arg, MessageContext, Mut, View, ViewMarker};
 use xilem::style::Style;
-use xilem::view::{checkbox, flex_col, flex_row, label, sized_box, text_button, text_input};
+use xilem::view::{
+    checkbox, flex_col, flex_row, grid, label, portal, sized_box, text_button, text_input, GridExt,
+};
 use xilem::{Color, Pod, TextAlign, ViewCtx, WidgetView, WindowOptions, Xilem};
 use xilem_core::{Edit, MessageResult};
 
 const CANVAS_WIDTH: f64 = 920.0;
 const CANVAS_HEIGHT: f64 = 620.0;
+const PRESET_GRID_COLUMNS: i32 = 4;
+const PRESET_PANEL_HEIGHT: f64 = 160.0;
 const HANDLE_RADIUS: f64 = 8.0;
 const BASELINE_RADIUS: f64 = HANDLE_RADIUS + 1.5;
 const NESTED_ENDPOINT_RADIUS: f64 = 4.5;
@@ -32,6 +36,266 @@ const HIT_RADIUS: f64 = 14.0;
 const MIN_SEGMENT_LENGTH: f64 = 2.5;
 const RENDER_BATCH_BUDGET: Duration = Duration::from_millis(5);
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
+const PRESET_TARGET_WIDTH: f64 = 560.0;
+const PRESET_TARGET_HEIGHT: f64 = 250.0;
+const PRESET_TARGET_CENTER: (f64, f64) = (350.0, 150.0);
+
+const KOCH_POINTS: &[(f64, f64)] = &[
+    (160.0, 150.0),
+    (260.0, 150.0),
+    (310.0, 85.0),
+    (360.0, 150.0),
+    (460.0, 150.0),
+];
+const LIGHTNING_POINTS: &[(f64, f64)] = &[
+    (170.0, 150.0),
+    (235.0, 125.0),
+    (285.0, 190.0),
+    (350.0, 110.0),
+    (415.0, 165.0),
+    (480.0, 145.0),
+];
+const CANYON_POINTS: &[(f64, f64)] = &[
+    (170.0, 155.0),
+    (245.0, 155.0),
+    (285.0, 215.0),
+    (350.0, 95.0),
+    (415.0, 215.0),
+    (455.0, 155.0),
+    (530.0, 155.0),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresetGroup {
+    Classic,
+    Experiment,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GeneratorKind {
+    Turtle {
+        commands: &'static str,
+        angle_deg: f64,
+    },
+    Points(&'static [(f64, f64)]),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PresetSpec {
+    name: &'static str,
+    group: PresetGroup,
+    generator: GeneratorKind,
+}
+
+const PRESETS: &[PresetSpec] = &[
+    PresetSpec {
+        name: "Koch Curve",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Points(KOCH_POINTS),
+    },
+    PresetSpec {
+        name: "Anti-Koch Inlet",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F-F++F-F",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Cesaro 70",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F--F+F",
+            angle_deg: 70.0,
+        },
+    },
+    PresetSpec {
+        name: "Cesaro 85",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F--F+F",
+            angle_deg: 85.0,
+        },
+    },
+    PresetSpec {
+        name: "Minkowski Sausage",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F-FF+F+F-F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Minkowski Mirror",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F-F+F+FF-F-F+F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Levy C",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F-F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Dragon Fold",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Terdragon",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F",
+            angle_deg: 120.0,
+        },
+    },
+    PresetSpec {
+        name: "Arrowhead",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Gosper Seed",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "A-B--B+A++AA+B-",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Hilbert U",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Peano Serpent",
+        group: PresetGroup::Classic,
+        generator: GeneratorKind::Turtle {
+            commands: "FF+F+F+FF-F-F+FF",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Lightning",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Points(LIGHTNING_POINTS),
+    },
+    PresetSpec {
+        name: "Canyon",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Points(CANYON_POINTS),
+    },
+    PresetSpec {
+        name: "Sawblade",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F+F-F+F",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Harbor Steps",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "FF+F-F+FF--F+F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Crown",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F+F--F+F",
+            angle_deg: 72.0,
+        },
+    },
+    PresetSpec {
+        name: "Orbit Hook",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F++F--F-F",
+            angle_deg: 45.0,
+        },
+    },
+    PresetSpec {
+        name: "Metro Weave",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F-F+FF-F+F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Trident",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F--F++F--F+F",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Needle Fern",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F+F++F-F",
+            angle_deg: 36.0,
+        },
+    },
+    PresetSpec {
+        name: "Ribbon Fold",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F-F+F++F-F",
+            angle_deg: 72.0,
+        },
+    },
+    PresetSpec {
+        name: "Wave Tank",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F-F--F+F++F-F",
+            angle_deg: 45.0,
+        },
+    },
+    PresetSpec {
+        name: "Catapult",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F++F-F+F--F",
+            angle_deg: 60.0,
+        },
+    },
+    PresetSpec {
+        name: "Switchback",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "FF-F+F-F+FF+F-F",
+            angle_deg: 90.0,
+        },
+    },
+    PresetSpec {
+        name: "Kite Spine",
+        group: PresetGroup::Experiment,
+        generator: GeneratorKind::Turtle {
+            commands: "F+F+F--F-F",
+            angle_deg: 72.0,
+        },
+    },
+];
 
 #[derive(Clone, Debug)]
 struct FractalGeometry {
@@ -42,48 +306,7 @@ struct FractalGeometry {
 
 impl FractalGeometry {
     fn koch() -> Self {
-        Self {
-            generator_points: vec![
-                (160.0, 150.0),
-                (260.0, 150.0),
-                (310.0, 85.0),
-                (360.0, 150.0),
-                (460.0, 150.0),
-            ],
-            baseline_points: [(160.0, 150.0), (460.0, 150.0)],
-            endpoint_docked: [true, true],
-        }
-    }
-
-    fn lightning() -> Self {
-        Self {
-            generator_points: vec![
-                (170.0, 150.0),
-                (235.0, 125.0),
-                (285.0, 190.0),
-                (350.0, 110.0),
-                (415.0, 165.0),
-                (480.0, 145.0),
-            ],
-            baseline_points: [(170.0, 150.0), (480.0, 145.0)],
-            endpoint_docked: [true, true],
-        }
-    }
-
-    fn canyon() -> Self {
-        Self {
-            generator_points: vec![
-                (170.0, 155.0),
-                (245.0, 155.0),
-                (285.0, 215.0),
-                (350.0, 95.0),
-                (415.0, 215.0),
-                (455.0, 155.0),
-                (530.0, 155.0),
-            ],
-            baseline_points: [(170.0, 155.0), (530.0, 155.0)],
-            endpoint_docked: [true, true],
-        }
+        geometry_from_points(KOCH_POINTS)
     }
 
     fn baseline(&self) -> [(f64, f64); 2] {
@@ -97,7 +320,7 @@ struct InteractivePaintApp {
     depth_input: String,
     show_guides: bool,
     geometry: FractalGeometry,
-    preset_name: &'static str,
+    preset_id: usize,
 }
 
 impl Default for InteractivePaintApp {
@@ -106,16 +329,24 @@ impl Default for InteractivePaintApp {
             depth: 5,
             depth_input: "5".to_string(),
             show_guides: true,
-            geometry: FractalGeometry::koch(),
-            preset_name: "Koch-ish",
+            geometry: preset_geometry(0),
+            preset_id: 0,
         }
     }
 }
 
 impl InteractivePaintApp {
-    fn set_preset(&mut self, preset_name: &'static str, geometry: FractalGeometry) {
-        self.preset_name = preset_name;
-        self.geometry = geometry;
+    fn active_preset(&self) -> &'static PresetSpec {
+        &PRESETS[self.preset_id]
+    }
+
+    fn apply_preset(&mut self, preset_id: usize) {
+        self.preset_id = preset_id;
+        self.geometry = preset_geometry(preset_id);
+    }
+
+    fn reset_current_preset(&mut self) {
+        self.geometry = preset_geometry(self.preset_id);
     }
 
     fn set_depth(&mut self, depth: usize) {
@@ -568,34 +799,18 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
     flex_col((
         label("Line Fractal Explorer").text_size(26.0),
         flex_row((
-            label(format!("Preset: {}", data.preset_name)),
+            label(format!("Preset: {}", data.active_preset().name)),
             label(format!("Depth: {}", data.depth)),
             label(data.estimated_segments_label()),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center)
         .gap(18.0.px()),
-        flex_row((
-            text_button("Koch-ish", |data: &mut InteractivePaintApp| {
-                data.set_preset("Koch-ish", FractalGeometry::koch());
-            }),
-            text_button("Lightning", |data: &mut InteractivePaintApp| {
-                data.set_preset("Lightning", FractalGeometry::lightning());
-            }),
-            text_button("Canyon", |data: &mut InteractivePaintApp| {
-                data.set_preset("Canyon", FractalGeometry::canyon());
-            }),
-            text_button("Reset", |data: &mut InteractivePaintApp| {
-                let preset = data.preset_name;
-                let geometry = match preset {
-                    "Lightning" => FractalGeometry::lightning(),
-                    "Canyon" => FractalGeometry::canyon(),
-                    _ => FractalGeometry::koch(),
-                };
-                data.set_preset(preset, geometry);
-            }),
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Center)
-        .gap(12.0.px()),
+        preset_section(data, "Classic Presets", PresetGroup::Classic),
+        preset_section(data, "Experimental Presets", PresetGroup::Experiment),
+        flex_row((text_button("Reset current preset", |data: &mut InteractivePaintApp| {
+            data.reset_current_preset();
+        }),))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
         flex_row((
             sized_box(label("Depth")).width(48.px()),
             text_button("-", |data: &mut InteractivePaintApp| {
@@ -639,6 +854,48 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
     ))
     .gap(14.0.px())
     .padding(20.0)
+}
+
+fn preset_section(
+    data: &InteractivePaintApp,
+    title: &'static str,
+    group: PresetGroup,
+) -> impl WidgetView<Edit<InteractivePaintApp>> + use<> {
+    let mut grid_items = Vec::new();
+    let mut count = 0usize;
+    for (preset_id, preset) in PRESETS.iter().enumerate() {
+        if preset.group != group {
+            continue;
+        }
+        let is_active = data.preset_id == preset_id;
+        let label_text = if is_active {
+            format!("{} *", preset.name)
+        } else {
+            preset.name.to_string()
+        };
+        grid_items.push(
+            text_button(label_text, move |data: &mut InteractivePaintApp| {
+                data.apply_preset(preset_id);
+            })
+            .disabled(is_active)
+            .grid_pos(
+                (count as i32) % PRESET_GRID_COLUMNS,
+                (count as i32) / PRESET_GRID_COLUMNS,
+            ),
+        );
+        count += 1;
+    }
+    let rows = ((count as i32) + PRESET_GRID_COLUMNS - 1) / PRESET_GRID_COLUMNS;
+
+    flex_col((
+        label(title).text_size(16.0),
+        sized_box(portal(
+            grid(grid_items, PRESET_GRID_COLUMNS, rows.max(1)).spacing(8.0.px()),
+        ))
+        .height(PRESET_PANEL_HEIGHT.px())
+        .width(860.0.px()),
+    ))
+    .gap(8.0.px())
 }
 
 fn apply_drag(
@@ -735,6 +992,30 @@ fn transform_points_between_baselines(
         .collect()
 }
 
+fn geometry_from_points(points: &[(f64, f64)]) -> FractalGeometry {
+    let generator_points = points.to_vec();
+    let baseline_points = [
+        generator_points.first().copied().unwrap_or((0.0, 0.0)),
+        generator_points.last().copied().unwrap_or((1.0, 0.0)),
+    ];
+    FractalGeometry {
+        generator_points,
+        baseline_points,
+        endpoint_docked: [true, true],
+    }
+}
+
+fn preset_geometry(preset_id: usize) -> FractalGeometry {
+    let preset = PRESETS.get(preset_id).copied().unwrap_or(PRESETS[0]);
+    match preset.generator {
+        GeneratorKind::Points(points) => geometry_from_points(points),
+        GeneratorKind::Turtle {
+            commands,
+            angle_deg,
+        } => geometry_from_turtle(commands, angle_deg),
+    }
+}
+
 fn normalized_points_from_baseline(
     points: &[(f64, f64)],
     baseline: [(f64, f64); 2],
@@ -766,6 +1047,79 @@ fn map_local(start: Point, end: Point, local: (f64, f64)) -> Point {
     let direction = end - start;
     let perpendicular = Vec2::new(-direction.y, direction.x);
     start + direction * local.0 + perpendicular * local.1
+}
+
+fn geometry_from_turtle(commands: &str, angle_deg: f64) -> FractalGeometry {
+    let raw_points = turtle_points(commands, angle_deg);
+    let baseline = [raw_points[0], *raw_points.last().unwrap()];
+    let local_points = normalized_points_from_baseline(&raw_points, baseline);
+
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &local_points {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    let local_width = (max_x - min_x).max(1.0);
+    let local_height = (max_y - min_y).max(0.3);
+    let scale = (PRESET_TARGET_WIDTH / local_width)
+        .min(PRESET_TARGET_HEIGHT / local_height)
+        .min(360.0);
+
+    let mut mapped_points: Vec<(f64, f64)> = local_points
+        .iter()
+        .map(|&(x, y)| (x * scale, y * scale))
+        .collect();
+
+    let (mut mapped_min_x, mut mapped_max_x, mut mapped_min_y, mut mapped_max_y) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &mapped_points {
+        mapped_min_x = mapped_min_x.min(x);
+        mapped_max_x = mapped_max_x.max(x);
+        mapped_min_y = mapped_min_y.min(y);
+        mapped_max_y = mapped_max_y.max(y);
+    }
+    let offset_x = PRESET_TARGET_CENTER.0 - (mapped_min_x + mapped_max_x) * 0.5;
+    let offset_y = PRESET_TARGET_CENTER.1 - (mapped_min_y + mapped_max_y) * 0.5;
+    for point in &mut mapped_points {
+        point.0 += offset_x;
+        point.1 += offset_y;
+    }
+
+    geometry_from_points(&mapped_points)
+}
+
+fn turtle_points(commands: &str, angle_deg: f64) -> Vec<(f64, f64)> {
+    let turn = angle_deg.to_radians();
+    let mut heading = 0.0f64;
+    let mut points = vec![(0.0, 0.0)];
+    for ch in commands.chars() {
+        match ch {
+            '+' => heading += turn,
+            '-' => heading -= turn,
+            ' ' | '\n' | '\t' => {}
+            _ => {
+                let (x, y) = points.last().copied().unwrap();
+                points.push((x + heading.cos(), y + heading.sin()));
+            }
+        }
+    }
+
+    if points.len() < 2 || distance(points[0].into(), (*points.last().unwrap()).into()) <= 1e-6 {
+        points.push((1.0, 0.0));
+    }
+    points
 }
 
 fn segment_too_small(start: Point, end: Point) -> bool {
@@ -1162,5 +1516,37 @@ mod tests {
             )
         );
         assert_ne!(moved.generator_points[1], geometry.generator_points[1]);
+    }
+
+    #[test]
+    fn preset_library_has_balanced_groups_and_valid_geometry() {
+        let classic_count = PRESETS
+            .iter()
+            .filter(|preset| preset.group == PresetGroup::Classic)
+            .count();
+        let experiment_count = PRESETS
+            .iter()
+            .filter(|preset| preset.group == PresetGroup::Experiment)
+            .count();
+
+        assert!((10..=15).contains(&classic_count));
+        assert!((10..=15).contains(&experiment_count));
+
+        for (preset_id, preset) in PRESETS.iter().enumerate() {
+            let geometry = preset_geometry(preset_id);
+            assert!(
+                geometry.generator_points.len() >= 2,
+                "{} should have at least two points",
+                preset.name
+            );
+            assert!(
+                distance(
+                    geometry.baseline_points[0].into(),
+                    geometry.baseline_points[1].into()
+                ) > 1.0,
+                "{} should have a non-degenerate baseline",
+                preset.name
+            );
+        }
     }
 }
