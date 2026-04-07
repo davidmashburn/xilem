@@ -394,6 +394,17 @@ struct BenchmarkStats {
     rasterized_lines: u128,
 }
 
+#[derive(Clone, Copy)]
+struct LocalSegment {
+    start: (f64, f64),
+    end: (f64, f64),
+}
+
+struct BenchmarkScratch {
+    buffer: Vec<u8>,
+    pending_segments: Vec<SegmentJob>,
+}
+
 #[derive(Clone, Debug)]
 enum DragTarget {
     EndpointEditor(usize),
@@ -412,7 +423,7 @@ struct CanvasWidget {
     drag_start_geometry: Option<FractalGeometry>,
     endpoint_revealed: [bool; 2],
     last_click: Option<(usize, Instant, Point)>,
-    normalized_generator_points: Vec<(f64, f64)>,
+    local_segments: Vec<LocalSegment>,
     pending_segments: Vec<SegmentJob>,
     blank_image: ImageBrush,
     front_image: ImageBrush,
@@ -439,7 +450,7 @@ impl Widget for CanvasWidget {
             };
             if job.depth == 0
                 || segment_too_small(job.start, job.end)
-                || self.normalized_generator_points.len() < 2
+                || self.local_segments.is_empty()
             {
                 rasterize_line(
                     &mut self.back_buffer,
@@ -451,10 +462,10 @@ impl Widget for CanvasWidget {
                 );
                 continue;
             }
-            for pair in self.normalized_generator_points.windows(2).rev() {
+            for segment in self.local_segments.iter().rev() {
                 self.pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, pair[0]),
-                    end: map_local(job.start, job.end, pair[1]),
+                    start: map_local(job.start, job.end, segment.start),
+                    end: map_local(job.start, job.end, segment.end),
                     depth: job.depth - 1,
                 });
             }
@@ -627,10 +638,8 @@ impl Widget for CanvasWidget {
 impl CanvasWidget {
     fn reset_render_progress(&mut self) {
         self.back_buffer.fill(0);
-        self.normalized_generator_points = normalized_points_from_baseline(
-            &self.geometry.generator_points,
-            self.geometry.baseline(),
-        );
+        self.local_segments =
+            local_segments_from_baseline(&self.geometry.generator_points, self.geometry.baseline());
         self.pending_segments.clear();
         self.front_image = self.blank_image.clone();
         if self.geometry.generator_points.len() >= 2 {
@@ -744,7 +753,7 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             drag_start_geometry: None,
             endpoint_revealed: [false, false],
             last_click: None,
-            normalized_generator_points: Vec::new(),
+            local_segments: Vec::new(),
             pending_segments: Vec::new(),
             blank_image: blank_image.clone(),
             front_image: blank_image,
@@ -1155,6 +1164,20 @@ fn image_brush_from_buffer(buffer: Vec<u8>) -> ImageBrush {
     })
 }
 
+fn local_segments_from_baseline(
+    points: &[(f64, f64)],
+    baseline: [(f64, f64); 2],
+) -> Vec<LocalSegment> {
+    let local_points = normalized_points_from_baseline(points, baseline);
+    local_points
+        .windows(2)
+        .map(|pair| LocalSegment {
+            start: pair[0],
+            end: pair[1],
+        })
+        .collect()
+}
+
 fn segment_too_small(start: Point, end: Point) -> bool {
     (end - start).hypot2() <= MIN_SEGMENT_LENGTH * MIN_SEGMENT_LENGTH
 }
@@ -1326,7 +1349,6 @@ fn rasterize_line_opaque(
     let mut y0 = start.y.round() as isize;
     let x1 = end.x.round() as isize;
     let y1 = end.y.round() as isize;
-
     let dx = (x1 - x0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let dy = -(y1 - y0).abs();
@@ -1382,16 +1404,19 @@ fn blend_pixel(buffer: &mut [u8], width: usize, height: usize, x: isize, y: isiz
         ((alpha + (buffer[idx + 3] as f32 / 255.0) * inv_alpha) * 255.0).round() as u8;
 }
 
-fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkStats {
+fn benchmark_rasterize(
+    depth: usize,
+    geometry: &FractalGeometry,
+    local_segments: &[LocalSegment],
+    scratch: &mut BenchmarkScratch,
+) -> BenchmarkStats {
     let width = CANVAS_WIDTH as usize;
     let height = CANVAS_HEIGHT as usize;
-    let mut buffer = vec![0u8; width * height * 4];
     let baseline = geometry.baseline();
-
-    let local_points = normalized_points_from_baseline(&geometry.generator_points, baseline);
-    let mut pending_segments: Vec<SegmentJob> = Vec::new();
+    scratch.buffer.fill(0);
+    scratch.pending_segments.clear();
     if geometry.generator_points.len() >= 2 {
-        pending_segments.push(SegmentJob {
+        scratch.pending_segments.push(SegmentJob {
             start: baseline[0].into(),
             end: baseline[1].into(),
             depth,
@@ -1401,12 +1426,12 @@ fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkSta
     let start = Instant::now();
     let mut expanded_jobs = 0u128;
     let mut rasterized_lines = 0u128;
-    while let Some(job) = pending_segments.pop() {
+    while let Some(job) = scratch.pending_segments.pop() {
         expanded_jobs += 1;
-        if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
             rasterized_lines += 1;
             rasterize_line(
-                &mut buffer,
+                &mut scratch.buffer,
                 width,
                 height,
                 job.start,
@@ -1414,10 +1439,10 @@ fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkSta
                 FRACTAL_COLOR,
             );
         } else {
-            for pair in local_points.windows(2).rev() {
-                pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, pair[0]),
-                    end: map_local(job.start, job.end, pair[1]),
+            for segment in local_segments.iter().rev() {
+                scratch.pending_segments.push(SegmentJob {
+                    start: map_local(job.start, job.end, segment.start),
+                    end: map_local(job.start, job.end, segment.end),
                     depth: job.depth - 1,
                 });
             }
@@ -1432,7 +1457,7 @@ fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkSta
 
 fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> BenchmarkStats {
     let baseline = geometry.baseline();
-    let local_points = normalized_points_from_baseline(&geometry.generator_points, baseline);
+    let local_segments = local_segments_from_baseline(&geometry.generator_points, baseline);
     let mut pending_segments: Vec<SegmentJob> = Vec::new();
     if geometry.generator_points.len() >= 2 {
         pending_segments.push(SegmentJob {
@@ -1449,7 +1474,7 @@ fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> Benchmark
     let mut rasterized_lines = 0u128;
     while let Some(job) = pending_segments.pop() {
         expanded_jobs += 1;
-        if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
             rasterized_lines += 1;
             scene.stroke(
                 &stroke,
@@ -1459,10 +1484,10 @@ fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> Benchmark
                 &Line::new(job.start, job.end),
             );
         } else {
-            for pair in local_points.windows(2).rev() {
+            for segment in local_segments.iter().rev() {
                 pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, pair[0]),
-                    end: map_local(job.start, job.end, pair[1]),
+                    start: map_local(job.start, job.end, segment.start),
+                    end: map_local(job.start, job.end, segment.end),
                     depth: job.depth - 1,
                 });
             }
@@ -1531,6 +1556,12 @@ fn run_benchmark() {
         };
         let geometry = preset_geometry(preset_id);
         let branch_factor = geometry.generator_points.len().saturating_sub(1).max(1);
+        let local_segments =
+            local_segments_from_baseline(&geometry.generator_points, geometry.baseline());
+        let mut scratch = BenchmarkScratch {
+            buffer: vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
+            pending_segments: Vec::new(),
+        };
         println!(
             "{} (branch factor {}, {} control points)",
             preset_name,
@@ -1548,7 +1579,7 @@ fn run_benchmark() {
             let mut expanded_jobs = 0u128;
             let mut rasterized_lines = 0u128;
             for _ in 0..iterations {
-                let stats = benchmark_rasterize(depth, &geometry);
+                let stats = benchmark_rasterize(depth, &geometry, &local_segments, &mut scratch);
                 expanded_jobs = stats.expanded_jobs;
                 rasterized_lines = stats.rasterized_lines;
                 raster_times.push(stats.elapsed);
