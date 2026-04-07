@@ -396,8 +396,10 @@ struct BenchmarkStats {
 
 #[derive(Clone, Copy)]
 struct LocalSegment {
-    start: (f64, f64),
-    end: (f64, f64),
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
 }
 
 struct BenchmarkScratch {
@@ -462,13 +464,13 @@ impl Widget for CanvasWidget {
                 );
                 continue;
             }
-            for segment in self.local_segments.iter().rev() {
-                self.pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, segment.start),
-                    end: map_local(job.start, job.end, segment.end),
-                    depth: job.depth - 1,
-                });
-            }
+            push_transformed_segments(
+                &mut self.pending_segments,
+                job.start,
+                job.end,
+                job.depth - 1,
+                &self.local_segments,
+            );
         }
 
         if !self.pending_segments.is_empty() {
@@ -1172,10 +1174,39 @@ fn local_segments_from_baseline(
     local_points
         .windows(2)
         .map(|pair| LocalSegment {
-            start: pair[0],
-            end: pair[1],
+            start_x: pair[0].0,
+            start_y: pair[0].1,
+            end_x: pair[1].0,
+            end_y: pair[1].1,
         })
         .collect()
+}
+
+fn push_transformed_segments(
+    pending_segments: &mut Vec<SegmentJob>,
+    start: Point,
+    end: Point,
+    depth: usize,
+    local_segments: &[LocalSegment],
+) {
+    let direction_x = end.x - start.x;
+    let direction_y = end.y - start.y;
+    let perpendicular_x = -direction_y;
+    let perpendicular_y = direction_x;
+
+    for segment in local_segments.iter().rev() {
+        pending_segments.push(SegmentJob {
+            start: Point::new(
+                start.x + direction_x * segment.start_x + perpendicular_x * segment.start_y,
+                start.y + direction_y * segment.start_x + perpendicular_y * segment.start_y,
+            ),
+            end: Point::new(
+                start.x + direction_x * segment.end_x + perpendicular_x * segment.end_y,
+                start.y + direction_y * segment.end_x + perpendicular_y * segment.end_y,
+            ),
+            depth,
+        });
+    }
 }
 
 fn segment_too_small(start: Point, end: Point) -> bool {
@@ -1355,6 +1386,47 @@ fn rasterize_line_opaque(
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut error = dx + dy;
 
+    if x0 >= 0
+        && y0 >= 0
+        && x1 >= 0
+        && y1 >= 0
+        && x0 < width as isize
+        && y0 < height as isize
+        && x1 < width as isize
+        && y1 < height as isize
+    {
+        let row_stride = (width * 4) as isize;
+        let step_x = sx * 4;
+        let step_y = sy * row_stride;
+        let mut idx = (y0 as usize * width * 4 + x0 as usize * 4) as isize;
+
+        loop {
+            let pixel_idx = idx as usize;
+            buffer[pixel_idx] = color[0];
+            buffer[pixel_idx + 1] = color[1];
+            buffer[pixel_idx + 2] = color[2];
+            buffer[pixel_idx + 3] = color[3];
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+
+            let twice_error = error * 2;
+            let move_x = twice_error >= dy;
+            let move_y = twice_error <= dx;
+            if move_x {
+                error += dy;
+                x0 += sx;
+                idx += step_x;
+            }
+            if move_y {
+                error += dx;
+                y0 += sy;
+                idx += step_y;
+            }
+        }
+        return;
+    }
+
     loop {
         set_pixel_opaque(buffer, width, height, x0, y0, color);
         if x0 == x1 && y0 == y1 {
@@ -1439,13 +1511,13 @@ fn benchmark_rasterize(
                 FRACTAL_COLOR,
             );
         } else {
-            for segment in local_segments.iter().rev() {
-                scratch.pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, segment.start),
-                    end: map_local(job.start, job.end, segment.end),
-                    depth: job.depth - 1,
-                });
-            }
+            push_transformed_segments(
+                &mut scratch.pending_segments,
+                job.start,
+                job.end,
+                job.depth - 1,
+                local_segments,
+            );
         }
     }
     BenchmarkStats {
@@ -1484,13 +1556,13 @@ fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> Benchmark
                 &Line::new(job.start, job.end),
             );
         } else {
-            for segment in local_segments.iter().rev() {
-                pending_segments.push(SegmentJob {
-                    start: map_local(job.start, job.end, segment.start),
-                    end: map_local(job.start, job.end, segment.end),
-                    depth: job.depth - 1,
-                });
-            }
+            push_transformed_segments(
+                &mut pending_segments,
+                job.start,
+                job.end,
+                job.depth - 1,
+                &local_segments,
+            );
         }
     }
     BenchmarkStats {
