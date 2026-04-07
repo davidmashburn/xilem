@@ -1,0 +1,6 @@
+[alias]
+interactive-paint-bench = "run --release -p xilem --example interactive_paint -- --benchmark"
+interactive-paint-bench-native = "run --release -p xilem --example interactive_paint -- --benchmark"
+
+[env]
+INTERACTIVE_PAINT_BENCH_HELP = "Use `cargo interactive-paint-bench` for release throughput or `RUSTFLAGS='-C target-cpu=native' cargo interactive-paint-bench-native` for the host-tuned ceiling."
