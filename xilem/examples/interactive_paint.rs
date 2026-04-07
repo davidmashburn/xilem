@@ -396,6 +396,12 @@ struct BenchmarkStats {
     rasterized_lines: u128,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RasterBenchmarkMode {
+    Serial,
+    Parallel,
+}
+
 #[derive(Clone, Copy)]
 struct LocalSegment {
     start_x: f64,
@@ -1761,6 +1767,23 @@ fn benchmark_depths(branch_factor: usize) -> &'static [usize] {
     }
 }
 
+fn choose_raster_benchmark_mode(stats: &BenchmarkStats) -> RasterBenchmarkMode {
+    if benchmark_worker_count() > 1
+        && (stats.rasterized_lines >= 50_000 || stats.expanded_jobs >= 100_000)
+    {
+        RasterBenchmarkMode::Parallel
+    } else {
+        RasterBenchmarkMode::Serial
+    }
+}
+
+fn raster_benchmark_mode_label(mode: RasterBenchmarkMode) -> &'static str {
+    match mode {
+        RasterBenchmarkMode::Serial => "serial",
+        RasterBenchmarkMode::Parallel => "parallel",
+    }
+}
+
 fn run_benchmark() {
     println!("\n=== Rust Fractal Rasterization Benchmark ===\n");
     if cfg!(debug_assertions) {
@@ -1800,36 +1823,45 @@ fn run_benchmark() {
             let theoretical_jobs = count_total_jobs(depth, branch_factor);
 
             let iterations = 5;
+            let probe_stats = benchmark_rasterize(depth, &geometry, &local_segments, &mut scratch);
+            let selected_mode = choose_raster_benchmark_mode(&probe_stats);
             let mut raster_times = Vec::with_capacity(iterations);
-            let mut parallel_raster_times = Vec::with_capacity(iterations);
+            let mut selected_times = Vec::with_capacity(iterations);
             let mut vector_times = Vec::with_capacity(iterations);
-            let mut expanded_jobs = 0u128;
-            let mut rasterized_lines = 0u128;
-            for _ in 0..iterations {
+            let expanded_jobs = probe_stats.expanded_jobs;
+            let rasterized_lines = probe_stats.rasterized_lines;
+            raster_times.push(probe_stats.elapsed);
+            selected_times.push(match selected_mode {
+                RasterBenchmarkMode::Serial => probe_stats.elapsed,
+                RasterBenchmarkMode::Parallel => {
+                    benchmark_parallel_rasterize(depth, &geometry, &local_segments).elapsed
+                }
+            });
+            vector_times.push(benchmark_vector_scene(depth, &geometry).elapsed);
+            for _ in 1..iterations {
                 let stats = benchmark_rasterize(depth, &geometry, &local_segments, &mut scratch);
-                expanded_jobs = stats.expanded_jobs;
-                rasterized_lines = stats.rasterized_lines;
                 raster_times.push(stats.elapsed);
-                parallel_raster_times
-                    .push(benchmark_parallel_rasterize(depth, &geometry, &local_segments).elapsed);
+                selected_times.push(match selected_mode {
+                    RasterBenchmarkMode::Serial => stats.elapsed,
+                    RasterBenchmarkMode::Parallel => {
+                        benchmark_parallel_rasterize(depth, &geometry, &local_segments).elapsed
+                    }
+                });
                 vector_times.push(benchmark_vector_scene(depth, &geometry).elapsed);
             }
 
             let raster_avg = raster_times.iter().sum::<Duration>() / iterations as u32;
-            let parallel_raster_avg =
-                parallel_raster_times.iter().sum::<Duration>() / iterations as u32;
+            let selected_avg = selected_times.iter().sum::<Duration>() / iterations as u32;
             let vector_avg = vector_times.iter().sum::<Duration>() / iterations as u32;
             let raster_lines_per_sec = rasterized_lines as f64 / raster_avg.as_secs_f64();
             let raster_jobs_per_sec = expanded_jobs as f64 / raster_avg.as_secs_f64();
-            let parallel_raster_lines_per_sec =
-                rasterized_lines as f64 / parallel_raster_avg.as_secs_f64();
-            let parallel_raster_jobs_per_sec =
-                expanded_jobs as f64 / parallel_raster_avg.as_secs_f64();
+            let selected_lines_per_sec = rasterized_lines as f64 / selected_avg.as_secs_f64();
+            let selected_jobs_per_sec = expanded_jobs as f64 / selected_avg.as_secs_f64();
             let vector_lines_per_sec = rasterized_lines as f64 / vector_avg.as_secs_f64();
             let vector_jobs_per_sec = expanded_jobs as f64 / vector_avg.as_secs_f64();
 
             println!(
-                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | raster {:.0} lines/sec, {:.0} jobs/sec | parallel {:.0} lines/sec, {:.0} jobs/sec | vector {:.0} lines/sec, {:.0} jobs/sec",
+                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | raster {:.0} lines/sec, {:.0} jobs/sec | adaptive {} {:.0} lines/sec, {:.0} jobs/sec | vector {:.0} lines/sec, {:.0} jobs/sec",
                 depth,
                 format_u128(theoretical_lines),
                 format_u128(theoretical_jobs),
@@ -1837,8 +1869,9 @@ fn run_benchmark() {
                 format_u128(expanded_jobs),
                 raster_lines_per_sec,
                 raster_jobs_per_sec,
-                parallel_raster_lines_per_sec,
-                parallel_raster_jobs_per_sec,
+                raster_benchmark_mode_label(selected_mode),
+                selected_lines_per_sec,
+                selected_jobs_per_sec,
                 vector_lines_per_sec,
                 vector_jobs_per_sec
             );
