@@ -39,6 +39,7 @@ const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 const PRESET_TARGET_WIDTH: f64 = 560.0;
 const PRESET_TARGET_HEIGHT: f64 = 250.0;
 const PRESET_TARGET_CENTER: (f64, f64) = (350.0, 150.0);
+const FRACTAL_COLOR: [u8; 4] = [28, 96, 99, 255];
 
 const KOCH_POINTS: &[(f64, f64)] = &[
     (160.0, 150.0),
@@ -445,7 +446,7 @@ impl Widget for CanvasWidget {
                     CANVAS_HEIGHT as usize,
                     job.start,
                     job.end,
-                    [28, 96, 99, 255],
+                    FRACTAL_COLOR,
                 );
                 continue;
             }
@@ -1250,6 +1251,11 @@ fn rasterize_line(
     end: Point,
     color: [u8; 4],
 ) {
+    if color[3] == u8::MAX {
+        rasterize_line_opaque(buffer, width, height, start, end, color);
+        return;
+    }
+
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     let steps = dx.abs().max(dy.abs()).ceil() as usize;
@@ -1278,6 +1284,60 @@ fn rasterize_line(
             color,
         );
     }
+}
+
+fn rasterize_line_opaque(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    start: Point,
+    end: Point,
+    color: [u8; 4],
+) {
+    let mut x0 = start.x.round() as isize;
+    let mut y0 = start.y.round() as isize;
+    let x1 = end.x.round() as isize;
+    let y1 = end.y.round() as isize;
+
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+
+    loop {
+        set_pixel_opaque(buffer, width, height, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let twice_error = error * 2;
+        if twice_error >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if twice_error <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn set_pixel_opaque(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    color: [u8; 4],
+) {
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+        return;
+    }
+    let idx = ((y as usize * width) + x as usize) * 4;
+    buffer[idx] = color[0];
+    buffer[idx + 1] = color[1];
+    buffer[idx + 2] = color[2];
+    buffer[idx + 3] = color[3];
 }
 
 fn blend_pixel(buffer: &mut [u8], width: usize, height: usize, x: isize, y: isize, color: [u8; 4]) {
@@ -1323,7 +1383,7 @@ fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkSta
                 height,
                 job.start,
                 job.end,
-                [28, 96, 99, 255],
+                FRACTAL_COLOR,
             );
         } else {
             for pair in local_points.windows(2).rev() {
