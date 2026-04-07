@@ -3,6 +3,7 @@
 
 //! Interactive line fractal explorer built with a custom paint widget.
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use masonry::core::*;
@@ -39,6 +40,7 @@ const PRESET_TARGET_WIDTH: f64 = 560.0;
 const PRESET_TARGET_HEIGHT: f64 = 250.0;
 const PRESET_TARGET_CENTER: (f64, f64) = (350.0, 150.0);
 const FRACTAL_COLOR: [u8; 4] = [28, 96, 99, 255];
+const BENCHMARK_PARALLEL_SPLIT_FACTOR: usize = 4;
 
 const KOCH_POINTS: &[(f64, f64)] = &[
     (160.0, 150.0),
@@ -1484,42 +1486,110 @@ fn benchmark_rasterize(
 ) -> BenchmarkStats {
     let width = CANVAS_WIDTH as usize;
     let height = CANVAS_HEIGHT as usize;
-    let baseline = geometry.baseline();
     scratch.buffer.fill(0);
-    scratch.pending_segments.clear();
-    if geometry.generator_points.len() >= 2 {
-        scratch.pending_segments.push(SegmentJob {
-            start: baseline[0].into(),
-            end: baseline[1].into(),
-            depth,
-        });
+    seed_benchmark_jobs(depth, geometry, &mut scratch.pending_segments);
+
+    let start = Instant::now();
+    let (expanded_jobs, rasterized_lines) = run_raster_jobs(
+        &mut scratch.buffer,
+        width,
+        height,
+        local_segments,
+        &mut scratch.pending_segments,
+    );
+    BenchmarkStats {
+        elapsed: start.elapsed(),
+        expanded_jobs,
+        rasterized_lines,
+    }
+}
+
+fn benchmark_parallel_rasterize(
+    depth: usize,
+    geometry: &FractalGeometry,
+    local_segments: &[LocalSegment],
+) -> BenchmarkStats {
+    let width = CANVAS_WIDTH as usize;
+    let height = CANVAS_HEIGHT as usize;
+    let buffer_len = width * height * 4;
+    let worker_count = benchmark_worker_count();
+
+    if worker_count <= 1 || geometry.generator_points.len() < 2 {
+        let mut scratch = BenchmarkScratch {
+            buffer: vec![0; buffer_len],
+            pending_segments: Vec::new(),
+        };
+        return benchmark_rasterize(depth, geometry, local_segments, &mut scratch);
+    }
+
+    let mut frontier = Vec::new();
+    seed_benchmark_jobs(depth, geometry, &mut frontier);
+    split_benchmark_frontier(
+        &mut frontier,
+        local_segments,
+        worker_count * BENCHMARK_PARALLEL_SPLIT_FACTOR,
+    );
+    if frontier.len() <= 1 {
+        let mut scratch = BenchmarkScratch {
+            buffer: vec![0; buffer_len],
+            pending_segments: frontier,
+        };
+        scratch.buffer.fill(0);
+        let start = Instant::now();
+        let (expanded_jobs, rasterized_lines) = run_raster_jobs(
+            &mut scratch.buffer,
+            width,
+            height,
+            local_segments,
+            &mut scratch.pending_segments,
+        );
+        return BenchmarkStats {
+            elapsed: start.elapsed(),
+            expanded_jobs,
+            rasterized_lines,
+        };
+    }
+
+    let worker_count = worker_count.min(frontier.len());
+    let mut shards = vec![Vec::new(); worker_count];
+    for (index, job) in frontier.into_iter().enumerate() {
+        shards[index % worker_count].push(job);
     }
 
     let start = Instant::now();
+    let mut final_buffer = vec![0; buffer_len];
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for pending_segments in shards {
+            handles.push(scope.spawn(move || {
+                let mut buffer = vec![0; buffer_len];
+                let mut pending_segments = pending_segments;
+                let (expanded_jobs, rasterized_lines) = run_raster_jobs(
+                    &mut buffer,
+                    width,
+                    height,
+                    local_segments,
+                    &mut pending_segments,
+                );
+                (buffer, expanded_jobs, rasterized_lines)
+            }));
+        }
+
+        let mut results = Vec::with_capacity(worker_count);
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+        results
+    });
+
     let mut expanded_jobs = 0u128;
     let mut rasterized_lines = 0u128;
-    while let Some(job) = scratch.pending_segments.pop() {
-        expanded_jobs += 1;
-        if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
-            rasterized_lines += 1;
-            rasterize_line(
-                &mut scratch.buffer,
-                width,
-                height,
-                job.start,
-                job.end,
-                FRACTAL_COLOR,
-            );
-        } else {
-            push_transformed_segments(
-                &mut scratch.pending_segments,
-                job.start,
-                job.end,
-                job.depth - 1,
-                local_segments,
-            );
-        }
+    for (buffer, worker_jobs, worker_lines) in results {
+        merge_opaque_buffers(&mut final_buffer, &buffer);
+        expanded_jobs += worker_jobs;
+        rasterized_lines += worker_lines;
     }
+
     BenchmarkStats {
         elapsed: start.elapsed(),
         expanded_jobs,
@@ -1572,6 +1642,80 @@ fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> Benchmark
     }
 }
 
+fn seed_benchmark_jobs(
+    depth: usize,
+    geometry: &FractalGeometry,
+    pending_segments: &mut Vec<SegmentJob>,
+) {
+    pending_segments.clear();
+    if geometry.generator_points.len() >= 2 {
+        let baseline = geometry.baseline();
+        pending_segments.push(SegmentJob {
+            start: baseline[0].into(),
+            end: baseline[1].into(),
+            depth,
+        });
+    }
+}
+
+fn benchmark_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
+fn split_benchmark_frontier(
+    frontier: &mut Vec<SegmentJob>,
+    local_segments: &[LocalSegment],
+    target_jobs: usize,
+) {
+    let mut index = 0;
+    while frontier.len() < target_jobs && index < frontier.len() {
+        let job = frontier[index];
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
+            index += 1;
+            continue;
+        }
+        frontier.swap_remove(index);
+        push_transformed_segments(frontier, job.start, job.end, job.depth - 1, local_segments);
+    }
+}
+
+fn run_raster_jobs(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    local_segments: &[LocalSegment],
+    pending_segments: &mut Vec<SegmentJob>,
+) -> (u128, u128) {
+    let mut expanded_jobs = 0u128;
+    let mut rasterized_lines = 0u128;
+    while let Some(job) = pending_segments.pop() {
+        expanded_jobs += 1;
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
+            rasterized_lines += 1;
+            rasterize_line(buffer, width, height, job.start, job.end, FRACTAL_COLOR);
+        } else {
+            push_transformed_segments(
+                pending_segments,
+                job.start,
+                job.end,
+                job.depth - 1,
+                local_segments,
+            );
+        }
+    }
+    (expanded_jobs, rasterized_lines)
+}
+
+fn merge_opaque_buffers(dst: &mut [u8], src: &[u8]) {
+    for (dst_pixel, src_pixel) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        if src_pixel[3] != 0 {
+            dst_pixel.copy_from_slice(src_pixel);
+        }
+    }
+}
+
 fn count_leaf_segments(depth: usize, branch_factor: usize) -> u128 {
     let mut total = 1u128;
     for _ in 0..depth {
@@ -1619,8 +1763,18 @@ fn benchmark_depths(branch_factor: usize) -> &'static [usize] {
 
 fn run_benchmark() {
     println!("\n=== Rust Fractal Rasterization Benchmark ===\n");
+    if cfg!(debug_assertions) {
+        println!(
+            "Warning: benchmark is running without --release; throughput will be misleadingly low."
+        );
+    }
     println!("Canvas size: {}x{}", CANVAS_WIDTH, CANVAS_HEIGHT);
-    println!("Presets: {}\n", BENCHMARK_PRESET_NAMES.join(", "));
+    println!(
+        "Workers: {} | Presets: {}",
+        benchmark_worker_count(),
+        BENCHMARK_PRESET_NAMES.join(", ")
+    );
+    println!("Tip: compare raw speed with `cargo run --release -p xilem --example interactive_paint -- --benchmark`.\n");
 
     for preset_name in BENCHMARK_PRESET_NAMES {
         let Some(preset_id) = preset_id_by_name(preset_name) else {
@@ -1647,6 +1801,7 @@ fn run_benchmark() {
 
             let iterations = 5;
             let mut raster_times = Vec::with_capacity(iterations);
+            let mut parallel_raster_times = Vec::with_capacity(iterations);
             let mut vector_times = Vec::with_capacity(iterations);
             let mut expanded_jobs = 0u128;
             let mut rasterized_lines = 0u128;
@@ -1655,18 +1810,26 @@ fn run_benchmark() {
                 expanded_jobs = stats.expanded_jobs;
                 rasterized_lines = stats.rasterized_lines;
                 raster_times.push(stats.elapsed);
+                parallel_raster_times
+                    .push(benchmark_parallel_rasterize(depth, &geometry, &local_segments).elapsed);
                 vector_times.push(benchmark_vector_scene(depth, &geometry).elapsed);
             }
 
             let raster_avg = raster_times.iter().sum::<Duration>() / iterations as u32;
+            let parallel_raster_avg =
+                parallel_raster_times.iter().sum::<Duration>() / iterations as u32;
             let vector_avg = vector_times.iter().sum::<Duration>() / iterations as u32;
             let raster_lines_per_sec = rasterized_lines as f64 / raster_avg.as_secs_f64();
             let raster_jobs_per_sec = expanded_jobs as f64 / raster_avg.as_secs_f64();
+            let parallel_raster_lines_per_sec =
+                rasterized_lines as f64 / parallel_raster_avg.as_secs_f64();
+            let parallel_raster_jobs_per_sec =
+                expanded_jobs as f64 / parallel_raster_avg.as_secs_f64();
             let vector_lines_per_sec = rasterized_lines as f64 / vector_avg.as_secs_f64();
             let vector_jobs_per_sec = expanded_jobs as f64 / vector_avg.as_secs_f64();
 
             println!(
-                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | raster {:.0} lines/sec, {:.0} jobs/sec | vector {:.0} lines/sec, {:.0} jobs/sec",
+                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | raster {:.0} lines/sec, {:.0} jobs/sec | parallel {:.0} lines/sec, {:.0} jobs/sec | vector {:.0} lines/sec, {:.0} jobs/sec",
                 depth,
                 format_u128(theoretical_lines),
                 format_u128(theoretical_jobs),
@@ -1674,6 +1837,8 @@ fn run_benchmark() {
                 format_u128(expanded_jobs),
                 raster_lines_per_sec,
                 raster_jobs_per_sec,
+                parallel_raster_lines_per_sec,
+                parallel_raster_jobs_per_sec,
                 vector_lines_per_sec,
                 vector_jobs_per_sec
             );
