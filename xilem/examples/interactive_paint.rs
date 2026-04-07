@@ -296,6 +296,14 @@ const PRESETS: &[PresetSpec] = &[
         },
     },
 ];
+const BENCHMARK_PRESET_NAMES: &[&str] = &[
+    "Koch Curve",
+    "Minkowski Sausage",
+    "Gosper Seed",
+    "Metro Weave",
+    "Switchback",
+    "Peano Serpent",
+];
 
 #[derive(Clone, Debug)]
 struct FractalGeometry {
@@ -305,10 +313,6 @@ struct FractalGeometry {
 }
 
 impl FractalGeometry {
-    fn koch() -> Self {
-        geometry_from_points(KOCH_POINTS)
-    }
-
     fn baseline(&self) -> [(f64, f64); 2] {
         self.baseline_points
     }
@@ -1369,55 +1373,69 @@ fn format_u128(value: u128) -> String {
     out
 }
 
+fn preset_id_by_name(name: &str) -> Option<usize> {
+    PRESETS.iter().position(|preset| preset.name == name)
+}
+
+fn benchmark_depths(branch_factor: usize) -> &'static [usize] {
+    if branch_factor >= 7 {
+        &[3, 4, 5, 6, 7, 8]
+    } else if branch_factor >= 5 {
+        &[4, 5, 6, 7, 8, 10]
+    } else {
+        &[5, 8, 10, 12, 14, 16]
+    }
+}
+
 fn run_benchmark() {
-    let geometry = FractalGeometry::koch();
-    let branch_factor = geometry.generator_points.len().saturating_sub(1).max(1);
     println!("\n=== Rust Fractal Rasterization Benchmark ===\n");
     println!("Canvas size: {}x{}", CANVAS_WIDTH, CANVAS_HEIGHT);
-    println!("Branch factor: {} segments/iteration\n", branch_factor);
+    println!("Presets: {}\n", BENCHMARK_PRESET_NAMES.join(", "));
 
-    for depth in [5, 8, 10, 12, 14, 16, 18, 20] {
-        let theoretical_lines = count_leaf_segments(depth, branch_factor);
-        let theoretical_jobs = count_total_jobs(depth, branch_factor);
+    for preset_name in BENCHMARK_PRESET_NAMES {
+        let Some(preset_id) = preset_id_by_name(preset_name) else {
+            continue;
+        };
+        let geometry = preset_geometry(preset_id);
+        let branch_factor = geometry.generator_points.len().saturating_sub(1).max(1);
         println!(
-            "Depth {}: theoretical lines={}, total jobs={}",
-            depth,
-            format_u128(theoretical_lines),
-            format_u128(theoretical_jobs)
+            "{} (branch factor {}, {} control points)",
+            preset_name,
+            branch_factor,
+            geometry.generator_points.len()
         );
 
-        let iterations = 5;
-        let mut times = Vec::with_capacity(iterations);
-        let mut expanded_jobs = 0u128;
-        let mut rasterized_lines = 0u128;
-        for _ in 0..iterations {
-            let stats = benchmark_rasterize(depth, &geometry);
-            expanded_jobs = stats.expanded_jobs;
-            rasterized_lines = stats.rasterized_lines;
-            times.push(stats.elapsed);
+        for &depth in benchmark_depths(branch_factor) {
+            let theoretical_lines = count_leaf_segments(depth, branch_factor);
+            let theoretical_jobs = count_total_jobs(depth, branch_factor);
+
+            let iterations = 5;
+            let mut times = Vec::with_capacity(iterations);
+            let mut expanded_jobs = 0u128;
+            let mut rasterized_lines = 0u128;
+            for _ in 0..iterations {
+                let stats = benchmark_rasterize(depth, &geometry);
+                expanded_jobs = stats.expanded_jobs;
+                rasterized_lines = stats.rasterized_lines;
+                times.push(stats.elapsed);
+            }
+
+            let avg = times.iter().sum::<Duration>() / iterations as u32;
+            let lines_per_sec = rasterized_lines as f64 / avg.as_secs_f64();
+            let jobs_per_sec = expanded_jobs as f64 / avg.as_secs_f64();
+
+            println!(
+                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | {:.0} lines/sec, {:.0} jobs/sec",
+                depth,
+                format_u128(theoretical_lines),
+                format_u128(theoretical_jobs),
+                format_u128(rasterized_lines),
+                format_u128(expanded_jobs),
+                lines_per_sec,
+                jobs_per_sec
+            );
         }
-
-        let avg = times.iter().sum::<Duration>() / iterations as u32;
-        let min = times.iter().min().copied().unwrap();
-        let max = times.iter().max().copied().unwrap();
-        let lines_per_sec = rasterized_lines as f64 / avg.as_secs_f64();
-        let jobs_per_sec = expanded_jobs as f64 / avg.as_secs_f64();
-
-        println!(
-            "  actual rasterized lines={}, expanded jobs={}",
-            format_u128(rasterized_lines),
-            format_u128(expanded_jobs)
-        );
-        println!(
-            "  avg={:.2}ms, min={:.2}ms, max={:.2}ms",
-            avg.as_secs_f64() * 1000.0,
-            min.as_secs_f64() * 1000.0,
-            max.as_secs_f64() * 1000.0
-        );
-        println!(
-            "  throughput: {:.0} lines/sec, {:.0} jobs/sec\n",
-            lines_per_sec, jobs_per_sec
-        );
+        println!();
     }
 }
 
@@ -1480,7 +1498,7 @@ mod tests {
 
     #[test]
     fn dragging_generator_shape_translates_all_generator_points_only() {
-        let geometry = FractalGeometry::koch();
+        let geometry = geometry_from_points(KOCH_POINTS);
         let moved = apply_drag(
             &geometry,
             &DragTarget::GeneratorShape,
@@ -1505,7 +1523,7 @@ mod tests {
 
     #[test]
     fn dragging_display_endpoint_transforms_interior_control_points() {
-        let geometry = FractalGeometry::koch();
+        let geometry = geometry_from_points(KOCH_POINTS);
         let moved = apply_drag(&geometry, &DragTarget::BasePoint(0), Vec2::new(20.0, 30.0));
 
         assert_eq!(
