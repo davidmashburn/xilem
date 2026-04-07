@@ -3,12 +3,11 @@
 
 //! Interactive line fractal explorer built with a custom paint widget.
 
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
-use masonry::peniko::{Fill, ImageBrush, ImageFormat};
+use masonry::peniko::{Blob, Fill, ImageBrush, ImageFormat};
 use masonry::properties::types::{AsUnit, CrossAxisAlignment};
 use masonry::util::fill;
 use masonry::vello::kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Size, Stroke, Vec2};
@@ -413,8 +412,11 @@ struct CanvasWidget {
     drag_start_geometry: Option<FractalGeometry>,
     endpoint_revealed: [bool; 2],
     last_click: Option<(usize, Instant, Point)>,
-    pending_segments: VecDeque<SegmentJob>,
-    raster_buffer: Vec<u8>,
+    normalized_generator_points: Vec<(f64, f64)>,
+    pending_segments: Vec<SegmentJob>,
+    blank_image: ImageBrush,
+    front_image: ImageBrush,
+    back_buffer: Vec<u8>,
 }
 
 impl Widget for CanvasWidget {
@@ -430,18 +432,17 @@ impl Widget for CanvasWidget {
             return;
         }
 
-        let local_points = normalized_points_from_baseline(
-            &self.geometry.generator_points,
-            self.geometry.baseline(),
-        );
         let deadline = Instant::now() + RENDER_BATCH_BUDGET;
         while Instant::now() < deadline {
-            let Some(job) = self.pending_segments.pop_back() else {
+            let Some(job) = self.pending_segments.pop() else {
                 break;
             };
-            if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
+            if job.depth == 0
+                || segment_too_small(job.start, job.end)
+                || self.normalized_generator_points.len() < 2
+            {
                 rasterize_line(
-                    &mut self.raster_buffer,
+                    &mut self.back_buffer,
                     CANVAS_WIDTH as usize,
                     CANVAS_HEIGHT as usize,
                     job.start,
@@ -450,8 +451,8 @@ impl Widget for CanvasWidget {
                 );
                 continue;
             }
-            for pair in local_points.windows(2).rev() {
-                self.pending_segments.push_back(SegmentJob {
+            for pair in self.normalized_generator_points.windows(2).rev() {
+                self.pending_segments.push(SegmentJob {
                     start: map_local(job.start, job.end, pair[0]),
                     end: map_local(job.start, job.end, pair[1]),
                     depth: job.depth - 1,
@@ -461,6 +462,8 @@ impl Widget for CanvasWidget {
 
         if !self.pending_segments.is_empty() {
             ctx.request_anim_frame();
+        } else {
+            self.publish_back_buffer();
         }
         ctx.request_paint_only();
     }
@@ -611,14 +614,7 @@ impl Widget for CanvasWidget {
             &preview_rect,
         );
 
-        let image = ImageBrush::new(ImageData {
-            data: self.raster_buffer.clone().into(),
-            format: ImageFormat::Rgba8,
-            alpha_type: ImageAlphaType::Alpha,
-            width: CANVAS_WIDTH as u32,
-            height: CANVAS_HEIGHT as u32,
-        });
-        scene.draw_image(&image, Affine::IDENTITY);
+        scene.draw_image(&self.front_image, Affine::IDENTITY);
 
         paint_baseline_line(scene, self.geometry.baseline());
         if self.show_guides {
@@ -630,16 +626,29 @@ impl Widget for CanvasWidget {
 
 impl CanvasWidget {
     fn reset_render_progress(&mut self) {
-        self.raster_buffer.fill(0);
+        self.back_buffer.fill(0);
+        self.normalized_generator_points = normalized_points_from_baseline(
+            &self.geometry.generator_points,
+            self.geometry.baseline(),
+        );
         self.pending_segments.clear();
+        self.front_image = self.blank_image.clone();
         if self.geometry.generator_points.len() >= 2 {
             let baseline = self.geometry.baseline();
-            self.pending_segments.push_back(SegmentJob {
+            self.pending_segments.push(SegmentJob {
                 start: baseline[0].into(),
                 end: baseline[1].into(),
                 depth: self.depth,
             });
         }
+    }
+
+    fn publish_back_buffer(&mut self) {
+        let completed = std::mem::replace(
+            &mut self.back_buffer,
+            vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
+        );
+        self.front_image = image_brush_from_buffer(completed);
     }
 
     fn hit_test(&self, point: Point) -> Option<DragTarget> {
@@ -720,6 +729,12 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         ctx: &mut ViewCtx,
         app_state: Arg<'_, Edit<InteractivePaintApp>>,
     ) -> (Self::Element, Self::ViewState) {
+        let back_buffer = vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4];
+        let blank_image =
+            image_brush_from_buffer(vec![
+                0;
+                (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4
+            ]);
         let widget = CanvasWidget {
             geometry: app_state.geometry.clone(),
             depth: app_state.depth,
@@ -729,8 +744,11 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             drag_start_geometry: None,
             endpoint_revealed: [false, false],
             last_click: None,
-            pending_segments: VecDeque::new(),
-            raster_buffer: vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
+            normalized_generator_points: Vec::new(),
+            pending_segments: Vec::new(),
+            blank_image: blank_image.clone(),
+            front_image: blank_image,
+            back_buffer,
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
@@ -1127,6 +1145,16 @@ fn turtle_points(commands: &str, angle_deg: f64) -> Vec<(f64, f64)> {
     points
 }
 
+fn image_brush_from_buffer(buffer: Vec<u8>) -> ImageBrush {
+    ImageBrush::new(ImageData {
+        data: Blob::from(buffer),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: CANVAS_WIDTH as u32,
+        height: CANVAS_HEIGHT as u32,
+    })
+}
+
 fn segment_too_small(start: Point, end: Point) -> bool {
     (end - start).hypot2() <= MIN_SEGMENT_LENGTH * MIN_SEGMENT_LENGTH
 }
@@ -1402,6 +1430,51 @@ fn benchmark_rasterize(depth: usize, geometry: &FractalGeometry) -> BenchmarkSta
     }
 }
 
+fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> BenchmarkStats {
+    let baseline = geometry.baseline();
+    let local_points = normalized_points_from_baseline(&geometry.generator_points, baseline);
+    let mut pending_segments: Vec<SegmentJob> = Vec::new();
+    if geometry.generator_points.len() >= 2 {
+        pending_segments.push(SegmentJob {
+            start: baseline[0].into(),
+            end: baseline[1].into(),
+            depth,
+        });
+    }
+
+    let mut scene = Scene::new();
+    let stroke = Stroke::new(1.0);
+    let start = Instant::now();
+    let mut expanded_jobs = 0u128;
+    let mut rasterized_lines = 0u128;
+    while let Some(job) = pending_segments.pop() {
+        expanded_jobs += 1;
+        if job.depth == 0 || segment_too_small(job.start, job.end) || local_points.len() < 2 {
+            rasterized_lines += 1;
+            scene.stroke(
+                &stroke,
+                Affine::IDENTITY,
+                Color::from_rgb8(FRACTAL_COLOR[0], FRACTAL_COLOR[1], FRACTAL_COLOR[2]),
+                None,
+                &Line::new(job.start, job.end),
+            );
+        } else {
+            for pair in local_points.windows(2).rev() {
+                pending_segments.push(SegmentJob {
+                    start: map_local(job.start, job.end, pair[0]),
+                    end: map_local(job.start, job.end, pair[1]),
+                    depth: job.depth - 1,
+                });
+            }
+        }
+    }
+    BenchmarkStats {
+        elapsed: start.elapsed(),
+        expanded_jobs,
+        rasterized_lines,
+    }
+}
+
 fn count_leaf_segments(depth: usize, branch_factor: usize) -> u128 {
     let mut total = 1u128;
     for _ in 0..depth {
@@ -1470,29 +1543,36 @@ fn run_benchmark() {
             let theoretical_jobs = count_total_jobs(depth, branch_factor);
 
             let iterations = 5;
-            let mut times = Vec::with_capacity(iterations);
+            let mut raster_times = Vec::with_capacity(iterations);
+            let mut vector_times = Vec::with_capacity(iterations);
             let mut expanded_jobs = 0u128;
             let mut rasterized_lines = 0u128;
             for _ in 0..iterations {
                 let stats = benchmark_rasterize(depth, &geometry);
                 expanded_jobs = stats.expanded_jobs;
                 rasterized_lines = stats.rasterized_lines;
-                times.push(stats.elapsed);
+                raster_times.push(stats.elapsed);
+                vector_times.push(benchmark_vector_scene(depth, &geometry).elapsed);
             }
 
-            let avg = times.iter().sum::<Duration>() / iterations as u32;
-            let lines_per_sec = rasterized_lines as f64 / avg.as_secs_f64();
-            let jobs_per_sec = expanded_jobs as f64 / avg.as_secs_f64();
+            let raster_avg = raster_times.iter().sum::<Duration>() / iterations as u32;
+            let vector_avg = vector_times.iter().sum::<Duration>() / iterations as u32;
+            let raster_lines_per_sec = rasterized_lines as f64 / raster_avg.as_secs_f64();
+            let raster_jobs_per_sec = expanded_jobs as f64 / raster_avg.as_secs_f64();
+            let vector_lines_per_sec = rasterized_lines as f64 / vector_avg.as_secs_f64();
+            let vector_jobs_per_sec = expanded_jobs as f64 / vector_avg.as_secs_f64();
 
             println!(
-                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | {:.0} lines/sec, {:.0} jobs/sec",
+                "  depth {:>2}: theoretical lines={}, jobs={} | actual lines={}, jobs={} | raster {:.0} lines/sec, {:.0} jobs/sec | vector {:.0} lines/sec, {:.0} jobs/sec",
                 depth,
                 format_u128(theoretical_lines),
                 format_u128(theoretical_jobs),
                 format_u128(rasterized_lines),
                 format_u128(expanded_jobs),
-                lines_per_sec,
-                jobs_per_sec
+                raster_lines_per_sec,
+                raster_jobs_per_sec,
+                vector_lines_per_sec,
+                vector_jobs_per_sec
             );
         }
         println!();
