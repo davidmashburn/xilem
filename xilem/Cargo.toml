@@ -46,7 +46,7 @@ time = { workspace = true, features = ["local-offset"] }
 
 # Used for http_cats
 reqwest = { workspace = true }
-image = { workspace = true, features = ["jpeg"] }
+image = { workspace = true, features = ["jpeg", "png"] }
 
 # Make wgpu use tracing for its spans.
 profiling = { version = "1.0.17", features = ["profile-with-tracing"] }
