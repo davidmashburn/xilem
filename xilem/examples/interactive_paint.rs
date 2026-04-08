@@ -3,9 +3,13 @@
 
 //! Interactive line fractal explorer built with a custom paint widget.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use image::imageops::FilterType;
+use image::{Rgba, RgbaImage};
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
 use masonry::peniko::{Blob, Fill, ImageBrush, ImageFormat};
@@ -41,6 +45,10 @@ const PRESET_TARGET_HEIGHT: f64 = 250.0;
 const PRESET_TARGET_CENTER: (f64, f64) = (350.0, 150.0);
 const FRACTAL_COLOR: [u8; 4] = [28, 96, 99, 255];
 const BENCHMARK_PARALLEL_SPLIT_FACTOR: usize = 4;
+const MEDIA_OUTPUT_DIR: &str = "xilem/examples/interactive_paint_media";
+const GALLERY_COLUMNS: usize = 4;
+const GALLERY_THUMB_WIDTH: u32 = 400;
+const GALLERY_THUMB_HEIGHT: u32 = 270;
 
 const KOCH_POINTS: &[(f64, f64)] = &[
     (160.0, 150.0),
@@ -394,6 +402,13 @@ struct BenchmarkStats {
     elapsed: Duration,
     expanded_jobs: u128,
     rasterized_lines: u128,
+}
+
+struct RenderedPreset {
+    name: &'static str,
+    group: PresetGroup,
+    slug: String,
+    image: RgbaImage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1722,6 +1737,377 @@ fn merge_opaque_buffers(dst: &mut [u8], src: &[u8]) {
     }
 }
 
+fn default_media_output_dir() -> PathBuf {
+    PathBuf::from(MEDIA_OUTPUT_DIR)
+}
+
+fn export_media() -> Result<(), Box<dyn std::error::Error>> {
+    let output_dir = default_media_output_dir();
+    let gallery_dir = output_dir.join("gallery");
+    let frames_dir = output_dir.join("demo_frames");
+    fs::create_dir_all(&gallery_dir)?;
+    fs::create_dir_all(&frames_dir)?;
+
+    let mut rendered_presets = Vec::with_capacity(PRESETS.len());
+    for (preset_id, preset) in PRESETS.iter().enumerate() {
+        let geometry = preset_geometry(preset_id);
+        let depth = gallery_depth_for_geometry(&geometry);
+        let image = render_snapshot(depth, &geometry, true);
+        let slug = slugify_preset_name(preset.name);
+        save_rgba_image(&gallery_dir.join(format!("{slug}.png")), &image)?;
+        rendered_presets.push(RenderedPreset {
+            name: preset.name,
+            group: preset.group,
+            slug,
+            image,
+        });
+    }
+
+    save_contact_sheet(
+        &gallery_dir.join("classics_contact_sheet.png"),
+        rendered_presets
+            .iter()
+            .filter(|preset| preset.group == PresetGroup::Classic),
+    )?;
+    save_contact_sheet(
+        &gallery_dir.join("experiments_contact_sheet.png"),
+        rendered_presets
+            .iter()
+            .filter(|preset| preset.group == PresetGroup::Experiment),
+    )?;
+    write_gallery_markdown(&output_dir.join("gallery.md"), &rendered_presets)?;
+
+    export_demo_frames(&frames_dir)?;
+
+    println!("Wrote gallery assets to {}", gallery_dir.display());
+    println!("Wrote demo frames to {}", frames_dir.display());
+    println!(
+        "Encode video with: ffmpeg -y -framerate 12 -i {}/frame_%04d.png -c:v libx264 -pix_fmt yuv420p {}/interactive_paint_demo.mp4",
+        frames_dir.display(),
+        output_dir.display()
+    );
+
+    Ok(())
+}
+
+fn gallery_depth_for_geometry(geometry: &FractalGeometry) -> usize {
+    match geometry.generator_points.len().saturating_sub(1) {
+        0..=4 => 7,
+        5..=6 => 6,
+        7..=8 => 5,
+        _ => 4,
+    }
+}
+
+fn render_snapshot(depth: usize, geometry: &FractalGeometry, show_guides: bool) -> RgbaImage {
+    let width = CANVAS_WIDTH as usize;
+    let height = CANVAS_HEIGHT as usize;
+    let mut buffer = vec![0; width * height * 4];
+    fill_rect(
+        &mut buffer,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height,
+        [246, 242, 233, 255],
+    );
+    fill_rect(
+        &mut buffer,
+        width,
+        height,
+        24,
+        24,
+        872,
+        560,
+        [255, 255, 255, 255],
+    );
+    stroke_rect(
+        &mut buffer,
+        width,
+        height,
+        24,
+        24,
+        872,
+        560,
+        [204, 188, 160, 255],
+    );
+
+    let local_segments =
+        local_segments_from_baseline(&geometry.generator_points, geometry.baseline());
+    let mut pending_segments = Vec::new();
+    seed_benchmark_jobs(depth, geometry, &mut pending_segments);
+    let _ = run_raster_jobs(
+        &mut buffer,
+        width,
+        height,
+        &local_segments,
+        &mut pending_segments,
+    );
+
+    draw_polyline(
+        &mut buffer,
+        width,
+        height,
+        &geometry.baseline(),
+        [64, 115, 158, 255],
+    );
+
+    if show_guides {
+        draw_polyline(
+            &mut buffer,
+            width,
+            height,
+            &geometry.generator_points,
+            [186, 57, 39, 255],
+        );
+    }
+
+    for point in geometry.baseline() {
+        draw_filled_circle(
+            &mut buffer,
+            width,
+            height,
+            point.0.round() as isize,
+            point.1.round() as isize,
+            BASELINE_RADIUS.ceil() as isize,
+            [88, 140, 190, 255],
+        );
+    }
+
+    for (index, point) in geometry.generator_points.iter().enumerate() {
+        if !show_guides
+            && ((index == 0 && geometry.endpoint_docked[0])
+                || (index == geometry.generator_points.len() - 1 && geometry.endpoint_docked[1]))
+        {
+            continue;
+        }
+        draw_filled_circle(
+            &mut buffer,
+            width,
+            height,
+            point.0.round() as isize,
+            point.1.round() as isize,
+            HANDLE_RADIUS.ceil() as isize,
+            [207, 70, 49, 255],
+        );
+    }
+
+    RgbaImage::from_raw(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32, buffer)
+        .expect("snapshot buffer dimensions must match canvas")
+}
+
+fn fill_rect(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    color: [u8; 4],
+) {
+    let max_x = (x + rect_width).min(width);
+    let max_y = (y + rect_height).min(height);
+    for row in y..max_y {
+        for col in x..max_x {
+            let idx = (row * width + col) * 4;
+            buffer[idx..idx + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+fn stroke_rect(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    color: [u8; 4],
+) {
+    let x1 = x.saturating_add(rect_width).saturating_sub(1);
+    let y1 = y.saturating_add(rect_height).saturating_sub(1);
+    rasterize_line(
+        buffer,
+        width,
+        height,
+        Point::new(x as f64, y as f64),
+        Point::new(x1 as f64, y as f64),
+        color,
+    );
+    rasterize_line(
+        buffer,
+        width,
+        height,
+        Point::new(x as f64, y1 as f64),
+        Point::new(x1 as f64, y1 as f64),
+        color,
+    );
+    rasterize_line(
+        buffer,
+        width,
+        height,
+        Point::new(x as f64, y as f64),
+        Point::new(x as f64, y1 as f64),
+        color,
+    );
+    rasterize_line(
+        buffer,
+        width,
+        height,
+        Point::new(x1 as f64, y as f64),
+        Point::new(x1 as f64, y1 as f64),
+        color,
+    );
+}
+
+fn draw_polyline(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    points: &[(f64, f64)],
+    color: [u8; 4],
+) {
+    for pair in points.windows(2) {
+        rasterize_line(buffer, width, height, pair[0].into(), pair[1].into(), color);
+    }
+}
+
+fn draw_filled_circle(
+    buffer: &mut [u8],
+    width: usize,
+    height: usize,
+    center_x: isize,
+    center_y: isize,
+    radius: isize,
+    color: [u8; 4],
+) {
+    let radius_sq = radius * radius;
+    for y in (center_y - radius)..=(center_y + radius) {
+        for x in (center_x - radius)..=(center_x + radius) {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            if dx * dx + dy * dy <= radius_sq {
+                set_pixel_opaque(buffer, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn save_rgba_image(path: &Path, image: &RgbaImage) -> Result<(), Box<dyn std::error::Error>> {
+    image.save(path)?;
+    Ok(())
+}
+
+fn save_contact_sheet<'a, I>(path: &Path, presets: I) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = &'a RenderedPreset>,
+{
+    let presets: Vec<&RenderedPreset> = presets.into_iter().collect();
+    if presets.is_empty() {
+        return Ok(());
+    }
+
+    let rows = presets.len().div_ceil(GALLERY_COLUMNS);
+    let gutter = 24u32;
+    let sheet_width =
+        GALLERY_COLUMNS as u32 * GALLERY_THUMB_WIDTH + (GALLERY_COLUMNS as u32 + 1) * gutter;
+    let sheet_height = rows as u32 * GALLERY_THUMB_HEIGHT + (rows as u32 + 1) * gutter;
+    let mut sheet = RgbaImage::from_pixel(sheet_width, sheet_height, Rgba([246, 242, 233, 255]));
+
+    for (index, preset) in presets.into_iter().enumerate() {
+        let thumb = image::imageops::resize(
+            &preset.image,
+            GALLERY_THUMB_WIDTH,
+            GALLERY_THUMB_HEIGHT,
+            FilterType::Lanczos3,
+        );
+        let col = (index % GALLERY_COLUMNS) as u32;
+        let row = (index / GALLERY_COLUMNS) as u32;
+        let x = gutter + col * (GALLERY_THUMB_WIDTH + gutter);
+        let y = gutter + row * (GALLERY_THUMB_HEIGHT + gutter);
+        image::imageops::overlay(&mut sheet, &thumb, i64::from(x), i64::from(y));
+    }
+
+    sheet.save(path)?;
+    Ok(())
+}
+
+fn write_gallery_markdown(
+    path: &Path,
+    presets: &[RenderedPreset],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut markdown = String::new();
+    markdown.push_str("# Interactive Paint Gallery\n\n");
+    markdown.push_str("Generated from `interactive_paint.rs` export mode.\n\n");
+    markdown.push_str("## Contact Sheets\n\n");
+    markdown.push_str("### Classics\n\n");
+    markdown.push_str("![Classics](gallery/classics_contact_sheet.png)\n\n");
+    markdown.push_str("### Experiments\n\n");
+    markdown.push_str("![Experiments](gallery/experiments_contact_sheet.png)\n\n");
+
+    for group in [PresetGroup::Classic, PresetGroup::Experiment] {
+        let heading = match group {
+            PresetGroup::Classic => "## Classic Presets\n\n",
+            PresetGroup::Experiment => "## Experimental Presets\n\n",
+        };
+        markdown.push_str(heading);
+        for preset in presets.iter().filter(|preset| preset.group == group) {
+            markdown.push_str(&format!(
+                "### {}\n\n![{}](gallery/{}.png)\n\n",
+                preset.name, preset.name, preset.slug
+            ));
+        }
+    }
+
+    fs::write(path, markdown)?;
+    Ok(())
+}
+
+fn export_demo_frames(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut frame_index = 0usize;
+    for (preset_name, depths) in demo_sequence() {
+        let preset_id = preset_id_by_name(preset_name).expect("demo preset must exist");
+        let geometry = preset_geometry(preset_id);
+        for &depth in depths.iter() {
+            let image = render_snapshot(depth, &geometry, true);
+            for _ in 0..4 {
+                save_rgba_image(
+                    &output_dir.join(format!("frame_{frame_index:04}.png")),
+                    &image,
+                )?;
+                frame_index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn demo_sequence() -> &'static [(&'static str, &'static [usize])] {
+    &[
+        ("Koch Curve", &[3, 4, 5, 6]),
+        ("Gosper Seed", &[3, 4, 5, 6]),
+        ("Metro Weave", &[3, 4, 5, 6]),
+        ("Switchback", &[3, 4, 5, 6]),
+        ("Peano Serpent", &[3, 4, 5, 6, 7, 8]),
+    ]
+}
+
+fn slugify_preset_name(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('_') {
+            slug.push('_');
+        }
+    }
+    slug.trim_matches('_').to_string()
+}
+
 fn count_leaf_segments(depth: usize, branch_factor: usize) -> u128 {
     let mut total = 1u128;
     for _ in 0..depth {
@@ -1895,6 +2281,13 @@ fn main() -> Result<(), EventLoopError> {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"--benchmark".to_string()) {
         run_benchmark();
+        return Ok(());
+    }
+    if args.contains(&"--export-media".to_string()) {
+        if let Err(err) = export_media() {
+            eprintln!("failed to export interactive paint media: {err}");
+            std::process::exit(1);
+        }
         return Ok(());
     }
     run(EventLoop::with_user_event())
