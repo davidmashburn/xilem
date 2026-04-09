@@ -334,6 +334,7 @@ struct InteractivePaintApp {
     depth: usize,
     depth_input: String,
     show_guides: bool,
+    random_colors: bool,
     geometry: FractalGeometry,
     preset_id: usize,
 }
@@ -344,6 +345,7 @@ impl Default for InteractivePaintApp {
             depth: 5,
             depth_input: "5".to_string(),
             show_guides: true,
+            random_colors: false,
             geometry: preset_geometry(0),
             preset_id: 0,
         }
@@ -418,6 +420,12 @@ enum RasterBenchmarkMode {
     Parallel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineColorMode {
+    Solid,
+    Random,
+}
+
 #[derive(Clone, Copy)]
 struct LocalSegment {
     start_x: f64,
@@ -444,6 +452,7 @@ struct CanvasWidget {
     geometry: FractalGeometry,
     depth: usize,
     show_guides: bool,
+    line_color_mode: LineColorMode,
     drag_target: Option<DragTarget>,
     drag_anchor: Option<Point>,
     drag_start_geometry: Option<FractalGeometry>,
@@ -484,7 +493,7 @@ impl Widget for CanvasWidget {
                     CANVAS_HEIGHT as usize,
                     job.start,
                     job.end,
-                    FRACTAL_COLOR,
+                    fractal_line_color(job.start, job.end, self.line_color_mode),
                 );
                 continue;
             }
@@ -784,6 +793,11 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             geometry: app_state.geometry.clone(),
             depth: app_state.depth,
             show_guides: app_state.show_guides,
+            line_color_mode: if app_state.random_colors {
+                LineColorMode::Random
+            } else {
+                LineColorMode::Solid
+            },
             drag_target: None,
             drag_anchor: None,
             drag_start_geometry: None,
@@ -813,14 +827,21 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
 
         let depth_changed = element.widget.depth != app_state.depth;
         let guides_changed = element.widget.show_guides != app_state.show_guides;
+        let color_mode = if app_state.random_colors {
+            LineColorMode::Random
+        } else {
+            LineColorMode::Solid
+        };
+        let color_mode_changed = element.widget.line_color_mode != color_mode;
 
         if guides_changed {
             element.widget.show_guides = app_state.show_guides;
         }
 
-        if geometry_changed || depth_changed {
+        if geometry_changed || depth_changed || color_mode_changed {
             element.widget.geometry = app_state.geometry.clone();
             element.widget.depth = app_state.depth;
+            element.widget.line_color_mode = color_mode;
             element.widget.endpoint_revealed = [false, false];
             element.widget.reset_render_progress();
             element.ctx.request_anim_frame();
@@ -911,6 +932,9 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
             }),
             checkbox("Show guides", data.show_guides, |data: &mut InteractivePaintApp, checked| {
                 data.show_guides = checked;
+            }),
+            checkbox("Random colors", data.random_colors, |data: &mut InteractivePaintApp, checked| {
+                data.random_colors = checked;
             }),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1400,6 +1424,31 @@ fn rasterize_line(
             color,
         );
     }
+}
+
+fn fractal_line_color(start: Point, end: Point, mode: LineColorMode) -> [u8; 4] {
+    match mode {
+        LineColorMode::Solid => FRACTAL_COLOR,
+        LineColorMode::Random => random_line_color(start, end),
+    }
+}
+
+fn random_line_color(start: Point, end: Point) -> [u8; 4] {
+    let mut hash = 0x9E37_79B9_7F4A_7C15u64;
+    for value in [
+        start.x.to_bits(),
+        start.y.to_bits(),
+        end.x.to_bits(),
+        end.y.to_bits(),
+    ] {
+        hash ^= value;
+        hash = hash.rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
+    }
+
+    let red = 48 + ((hash & 0x7f) as u8);
+    let green = 48 + (((hash >> 8) & 0x7f) as u8);
+    let blue = 48 + (((hash >> 16) & 0x7f) as u8);
+    [red, green, blue, 255]
 }
 
 fn rasterize_line_opaque(
