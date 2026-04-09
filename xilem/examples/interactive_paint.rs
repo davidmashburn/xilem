@@ -39,6 +39,7 @@ const NESTED_HIT_TOLERANCE: f64 = 3.0;
 const HIT_RADIUS: f64 = 14.0;
 const MIN_SEGMENT_LENGTH: f64 = 2.5;
 const RENDER_BATCH_BUDGET: Duration = Duration::from_millis(5);
+const LIVE_PREVIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 const PRESET_TARGET_WIDTH: f64 = 560.0;
 const PRESET_TARGET_HEIGHT: f64 = 250.0;
@@ -450,9 +451,9 @@ struct CanvasWidget {
     last_click: Option<(usize, Instant, Point)>,
     local_segments: Vec<LocalSegment>,
     pending_segments: Vec<SegmentJob>,
-    blank_image: ImageBrush,
     front_image: ImageBrush,
     back_buffer: Vec<u8>,
+    last_preview_publish: Instant,
 }
 
 impl Widget for CanvasWidget {
@@ -497,6 +498,11 @@ impl Widget for CanvasWidget {
         }
 
         if !self.pending_segments.is_empty() {
+            let now = Instant::now();
+            if now.duration_since(self.last_preview_publish) >= LIVE_PREVIEW_PUBLISH_INTERVAL {
+                self.refresh_front_image_from_back_buffer();
+                self.last_preview_publish = now;
+            }
             ctx.request_anim_frame();
         } else {
             self.publish_back_buffer();
@@ -666,7 +672,7 @@ impl CanvasWidget {
         self.local_segments =
             local_segments_from_baseline(&self.geometry.generator_points, self.geometry.baseline());
         self.pending_segments.clear();
-        self.front_image = self.blank_image.clone();
+        self.last_preview_publish = Instant::now() - LIVE_PREVIEW_PUBLISH_INTERVAL;
         if self.geometry.generator_points.len() >= 2 {
             let baseline = self.geometry.baseline();
             self.pending_segments.push(SegmentJob {
@@ -683,6 +689,11 @@ impl CanvasWidget {
             vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4],
         );
         self.front_image = image_brush_from_buffer(completed);
+        self.last_preview_publish = Instant::now();
+    }
+
+    fn refresh_front_image_from_back_buffer(&mut self) {
+        self.front_image = image_brush_from_buffer(self.back_buffer.clone());
     }
 
     fn hit_test(&self, point: Point) -> Option<DragTarget> {
@@ -780,9 +791,9 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
             last_click: None,
             local_segments: Vec::new(),
             pending_segments: Vec::new(),
-            blank_image: blank_image.clone(),
             front_image: blank_image,
             back_buffer,
+            last_preview_publish: Instant::now(),
         };
         (ctx.with_action_widget(|ctx| ctx.create_pod(widget)), ())
     }
