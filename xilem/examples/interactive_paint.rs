@@ -12,21 +12,21 @@ use image::imageops::FilterType;
 use image::{Rgba, RgbaImage};
 use masonry::core::*;
 use masonry::dpi::LogicalSize;
-use masonry::peniko::{Blob, Fill, ImageBrush, ImageFormat};
-use masonry::properties::types::{AsUnit, CrossAxisAlignment};
-use masonry::util::fill;
-use masonry::vello::kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Size, Stroke, Vec2};
-use masonry::vello::Scene;
+use masonry::imaging::{Painter, record::Scene};
+use masonry::kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Size, Stroke, Vec2};
+use masonry::layout::{AsUnit, LenReq, Length};
+use masonry::peniko::{Blob, ImageBrush, ImageFormat};
+use masonry::peniko::{ImageAlphaType, ImageData};
+use masonry::properties::types::CrossAxisAlignment;
 use masonry_winit::app::{EventLoop, EventLoopBuilder};
-use vello::peniko::{ImageAlphaType, ImageData};
 use winit::error::EventLoopError;
-use xilem::core::{Arg, MessageContext, Mut, View, ViewMarker};
+use xilem::core::{MessageCtx, Mut, View, ViewMarker};
 use xilem::style::Style;
 use xilem::view::{
-    checkbox, flex_col, flex_row, grid, label, portal, sized_box, text_button, text_input, GridExt,
+    GridExt, checkbox, flex_col, flex_row, grid, label, portal, sized_box, text_button, text_input,
 };
 use xilem::{Color, Pod, TextAlign, ViewCtx, WidgetView, WindowOptions, Xilem};
-use xilem_core::{Edit, MessageResult};
+use xilem_core::MessageResult;
 
 const CANVAS_WIDTH: f64 = 920.0;
 const CANVAS_HEIGHT: f64 = 620.0;
@@ -540,14 +540,21 @@ impl Widget for CanvasWidget {
         ChildrenIds::new()
     }
 
-    fn layout(
+    fn measure(
         &mut self,
-        _: &mut LayoutCtx<'_>,
-        _: &mut PropertiesMut<'_>,
-        bc: &BoxConstraints,
-    ) -> Size {
-        bc.constrain((CANVAS_WIDTH, CANVAS_HEIGHT))
+        _: &mut MeasureCtx<'_>,
+        _: &PropertiesRef<'_>,
+        axis: masonry::kurbo::Axis,
+        _: LenReq,
+        _: Option<Length>,
+    ) -> Length {
+        match axis {
+            masonry::kurbo::Axis::Horizontal => Length::const_px(CANVAS_WIDTH),
+            masonry::kurbo::Axis::Vertical => Length::const_px(CANVAS_HEIGHT),
+        }
     }
+
+    fn layout(&mut self, _: &mut LayoutCtx<'_>, _: &PropertiesRef<'_>, _: Size) {}
 
     fn on_pointer_event(
         &mut self,
@@ -645,33 +652,29 @@ impl Widget for CanvasWidget {
         }
     }
 
-    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, scene: &mut Scene) {
-        let rect = ctx.size().to_rect();
-        fill(scene, &rect, Color::from_rgb8(246, 242, 233));
+    fn paint(&mut self, _: &mut PaintCtx<'_>, _: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        let rect = Rect::from_origin_size(Point::ORIGIN, (CANVAS_WIDTH, CANVAS_HEIGHT));
+        painter.fill(rect, Color::from_rgb8(246, 242, 233)).draw();
 
         let preview_rect = Rect::from_origin_size((24.0, 24.0), (872.0, 560.0));
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(255, 255, 255, 235),
-            None,
-            &preview_rect,
-        );
-        scene.stroke(
-            &Stroke::new(1.0),
-            Affine::IDENTITY,
-            Color::from_rgb8(204, 188, 160),
-            None,
-            &preview_rect,
-        );
+        painter
+            .fill(preview_rect, Color::from_rgba8(255, 255, 255, 235))
+            .draw();
+        painter
+            .stroke(
+                preview_rect,
+                &Stroke::new(1.0),
+                Color::from_rgb8(204, 188, 160),
+            )
+            .draw();
 
-        scene.draw_image(&self.front_image, Affine::IDENTITY);
+        painter.draw_image(&self.front_image, Affine::IDENTITY);
 
-        paint_baseline_line(scene, self.geometry.baseline());
+        paint_baseline_line(painter, self.geometry.baseline());
         if self.show_guides {
-            paint_generator_guides(scene, &self.geometry, self.endpoint_revealed);
+            paint_generator_guides(painter, &self.geometry, self.endpoint_revealed);
         }
-        paint_baseline_handles(scene, &self.geometry, self.endpoint_revealed);
+        paint_baseline_handles(painter, &self.geometry, self.endpoint_revealed);
     }
 }
 
@@ -774,14 +777,14 @@ struct CanvasView;
 
 impl ViewMarker for CanvasView {}
 
-impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
+impl View<InteractivePaintApp, (), ViewCtx> for CanvasView {
     type Element = Pod<CanvasWidget>;
     type ViewState = ();
 
     fn build(
         &self,
         ctx: &mut ViewCtx,
-        app_state: Arg<'_, Edit<InteractivePaintApp>>,
+        app_state: &mut InteractivePaintApp,
     ) -> (Self::Element, Self::ViewState) {
         let back_buffer = vec![0; (CANVAS_WIDTH as usize) * (CANVAS_HEIGHT as usize) * 4];
         let blank_image =
@@ -818,7 +821,7 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         _: &mut Self::ViewState,
         _: &mut ViewCtx,
         mut element: Mut<'_, Self::Element>,
-        app_state: Arg<'_, Edit<InteractivePaintApp>>,
+        app_state: &mut InteractivePaintApp,
     ) {
         let geometry_changed = element.widget.geometry.generator_points
             != app_state.geometry.generator_points
@@ -851,21 +854,14 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
         element.ctx.request_paint_only();
     }
 
-    fn teardown(
-        &self,
-        _: &mut Self::ViewState,
-        ctx: &mut ViewCtx,
-        element: Mut<'_, Self::Element>,
-    ) {
-        ctx.teardown_leaf(element);
-    }
+    fn teardown(&self, _: &mut Self::ViewState, _: &mut ViewCtx, _: Mut<'_, Self::Element>) {}
 
     fn message(
         &self,
         _: &mut Self::ViewState,
-        message: &mut MessageContext,
+        message: &mut MessageCtx,
         _element: Mut<'_, Self::Element>,
-        app_state: Arg<'_, Edit<InteractivePaintApp>>,
+        app_state: &mut InteractivePaintApp,
     ) -> MessageResult<()> {
         if message.take_first().is_some() {
             return MessageResult::Stale;
@@ -884,7 +880,7 @@ impl View<Edit<InteractivePaintApp>, (), ViewCtx> for CanvasView {
     }
 }
 
-fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<InteractivePaintApp>> + use<> {
+fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<InteractivePaintApp> + use<> {
     flex_col((
         label("Line Fractal Explorer").text_size(26.0),
         flex_row((
@@ -945,14 +941,14 @@ fn app_logic(data: &mut InteractivePaintApp) -> impl WidgetView<Edit<Interactive
         label("Drag red handles or the red scaffold to shape the generator. Drag blue handles or the blue line to reposition the baseline."),
     ))
     .gap(14.0.px())
-    .padding(20.0)
+    .padding(20.0_f64.px())
 }
 
 fn preset_section(
     data: &InteractivePaintApp,
     title: &'static str,
     group: PresetGroup,
-) -> impl WidgetView<Edit<InteractivePaintApp>> + use<> {
+) -> impl WidgetView<InteractivePaintApp> + use<> {
     let mut grid_items = Vec::new();
     let mut count = 0usize;
     for (preset_id, preset) in PRESETS.iter().enumerate() {
@@ -971,18 +967,26 @@ fn preset_section(
             })
             .disabled(is_active)
             .grid_pos(
-                (count as i32) % PRESET_GRID_COLUMNS,
-                (count as i32) / PRESET_GRID_COLUMNS,
+                ((count as i32) % PRESET_GRID_COLUMNS) as u16,
+                ((count as i32) / PRESET_GRID_COLUMNS) as u16,
             ),
         );
         count += 1;
     }
-    let rows = ((count as i32) + PRESET_GRID_COLUMNS - 1) / PRESET_GRID_COLUMNS;
-
+    let rows = count.div_ceil(PRESET_GRID_COLUMNS as usize).max(1);
     flex_col((
         label(title).text_size(16.0),
         sized_box(portal(
-            grid(grid_items, PRESET_GRID_COLUMNS, rows.max(1)).spacing(8.0.px()),
+            grid(grid_items)
+                .columns(xilem::view::repeat_tracks(
+                    PRESET_GRID_COLUMNS as usize,
+                    xilem::view::GridTrackSize::FRACTION,
+                ))
+                .rows(xilem::view::repeat_tracks(
+                    rows,
+                    xilem::view::GridTrackSize::FRACTION,
+                ))
+                .gap(8.0_f64.px()),
         ))
         .height(PRESET_PANEL_HEIGHT.px())
         .width(860.0.px()),
@@ -1272,7 +1276,7 @@ fn segment_too_small(start: Point, end: Point) -> bool {
 }
 
 fn paint_generator_guides(
-    scene: &mut Scene,
+    painter: &mut Painter<'_>,
     geometry: &FractalGeometry,
     endpoint_revealed: [bool; 2],
 ) {
@@ -1283,54 +1287,52 @@ fn paint_generator_guides(
         for point in &points[1..] {
             path.line_to(Point::new(point.0, point.1));
         }
-        scene.stroke(
-            &Stroke::new(2.0),
-            Affine::IDENTITY,
-            Color::from_rgb8(186, 57, 39),
-            None,
-            &path,
-        );
+        painter
+            .stroke(path, &Stroke::new(2.0), Color::from_rgb8(186, 57, 39))
+            .draw();
     }
 
     for (index, &(x, y)) in points.iter().enumerate() {
         let is_endpoint = index == 0 || index == points.len() - 1;
         let slot = if index == 0 { 0 } else { 1 };
         if is_endpoint && geometry.endpoint_docked[slot] {
-            paint_docked_endpoint(scene, Point::new(x, y), endpoint_revealed[slot]);
+            paint_docked_endpoint(painter, Point::new(x, y), endpoint_revealed[slot]);
         } else {
-            fill(
-                scene,
-                &Circle::new((x, y), HANDLE_RADIUS),
-                Color::from_rgb8(215, 83, 63),
-            );
+            painter
+                .fill(
+                    Circle::new((x, y), HANDLE_RADIUS),
+                    Color::from_rgb8(215, 83, 63),
+                )
+                .draw();
         }
     }
 }
 
-fn paint_baseline_line(scene: &mut Scene, base_line: [(f64, f64); 2]) {
-    scene.stroke(
-        &Stroke::new(3.0),
-        Affine::IDENTITY,
-        Color::from_rgb8(55, 108, 171),
-        None,
-        &Line::new(base_line[0], base_line[1]),
-    );
+fn paint_baseline_line(painter: &mut Painter<'_>, base_line: [(f64, f64); 2]) {
+    painter
+        .stroke(
+            Line::new(base_line[0], base_line[1]),
+            &Stroke::new(3.0),
+            Color::from_rgb8(55, 108, 171),
+        )
+        .draw();
 }
 
 fn paint_baseline_handles(
-    scene: &mut Scene,
+    painter: &mut Painter<'_>,
     geometry: &FractalGeometry,
     endpoint_revealed: [bool; 2],
 ) {
     for (index, point) in geometry.baseline().into_iter().enumerate() {
         if geometry.endpoint_docked[index] {
-            paint_docked_endpoint(scene, point.into(), endpoint_revealed[index]);
+            paint_docked_endpoint(painter, point.into(), endpoint_revealed[index]);
         } else {
-            fill(
-                scene,
-                &Circle::new(point, BASELINE_RADIUS),
-                Color::from_rgb8(87, 140, 201),
-            );
+            painter
+                .fill(
+                    Circle::new(point, BASELINE_RADIUS),
+                    Color::from_rgb8(87, 140, 201),
+                )
+                .draw();
         }
     }
 }
@@ -1360,7 +1362,7 @@ fn cross(a: Vec2, b: Vec2) -> f64 {
     a.x * b.y - a.y * b.x
 }
 
-fn paint_docked_endpoint(scene: &mut Scene, center: Point, red_active: bool) {
+fn paint_docked_endpoint(painter: &mut Painter<'_>, center: Point, red_active: bool) {
     let outer_radius = BASELINE_RADIUS;
     let inner_radius = NESTED_ENDPOINT_RADIUS;
     let blue = Color::from_rgb8(87, 140, 201);
@@ -1372,15 +1374,19 @@ fn paint_docked_endpoint(scene: &mut Scene, center: Point, red_active: bool) {
         (red, blue, Color::from_rgb8(250, 227, 235))
     };
 
-    fill(scene, &Circle::new(center, outer_radius), outer_color);
-    scene.stroke(
-        &Stroke::new(1.0),
-        Affine::IDENTITY,
-        ring_color,
-        None,
-        &Circle::new(center, outer_radius),
-    );
-    fill(scene, &Circle::new(center, inner_radius), inner_color);
+    painter
+        .fill(Circle::new(center, outer_radius), outer_color)
+        .draw();
+    painter
+        .stroke(
+            Circle::new(center, outer_radius),
+            &Stroke::new(1.0),
+            ring_color,
+        )
+        .draw();
+    painter
+        .fill(Circle::new(center, inner_radius), inner_color)
+        .draw();
 }
 
 fn rasterize_line(
@@ -1699,13 +1705,13 @@ fn benchmark_vector_scene(depth: usize, geometry: &FractalGeometry) -> Benchmark
         expanded_jobs += 1;
         if job.depth == 0 || segment_too_small(job.start, job.end) || local_segments.is_empty() {
             rasterized_lines += 1;
-            scene.stroke(
-                &stroke,
-                Affine::IDENTITY,
-                Color::from_rgb8(FRACTAL_COLOR[0], FRACTAL_COLOR[1], FRACTAL_COLOR[2]),
-                None,
-                &Line::new(job.start, job.end),
-            );
+            Painter::new(&mut scene)
+                .stroke(
+                    Line::new(job.start, job.end),
+                    &stroke,
+                    Color::from_rgb8(FRACTAL_COLOR[0], FRACTAL_COLOR[1], FRACTAL_COLOR[2]),
+                )
+                .draw();
         } else {
             push_transformed_segments(
                 &mut pending_segments,
@@ -2243,7 +2249,9 @@ fn run_benchmark() {
         benchmark_worker_count(),
         BENCHMARK_PRESET_NAMES.join(", ")
     );
-    println!("Tip: compare raw speed with `cargo run --release -p xilem --example interactive_paint -- --benchmark`.\n");
+    println!(
+        "Tip: compare raw speed with `cargo run --release -p xilem --example interactive_paint -- --benchmark`.\n"
+    );
 
     for preset_name in BENCHMARK_PRESET_NAMES {
         let Some(preset_id) = preset_id_by_name(preset_name) else {
